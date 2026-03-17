@@ -240,6 +240,37 @@ def save_positions(positions_data: dict) -> None:
         logger.error(f"Could not save positions: {e}")
 
 
+def calculate_shares(amount: float, entry_price: float) -> float:
+    """Calculate the number of shares from amount and entry price.
+
+    Args:
+        amount: The USDC amount spent.
+        entry_price: The price per share.
+
+    Returns:
+        Number of shares (amount / entry_price), or 0 if entry_price <= 0.
+    """
+    if entry_price <= 0:
+        return 0.0
+    return amount / entry_price
+
+
+def parse_position_date(timestamp: str) -> str:
+    """Parse timestamp and return date string (YYYY-MM-DD).
+
+    Args:
+        timestamp: ISO format timestamp string.
+
+    Returns:
+        Date string in YYYY-MM-DD format, or "Unknown" on error.
+    """
+    try:
+        dt = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        return dt.strftime("%Y-%m-%d")
+    except (ValueError, AttributeError):
+        return "Unknown"
+
+
 def add_position(
     market_id: str,
     token_id: str,
@@ -296,12 +327,20 @@ def close_position(
     """
     positions = load_positions()
 
-    # Find the position to close
+    # Find the position to close - match on both market_id and token_id
+    # to avoid closing wrong position when multiple positions exist
     position_index = None
     for i, pos in enumerate(positions["open"]):
-        if pos["token_id"] == token_id:
+        if pos["token_id"] == token_id and pos.get("market_id", "") == market_id:
             position_index = i
             break
+
+    # Fallback: if no exact match, try matching just token_id (backward compatibility)
+    if position_index is None:
+        for i, pos in enumerate(positions["open"]):
+            if pos["token_id"] == token_id:
+                position_index = i
+                break
 
     if position_index is None:
         logger.warning(f"Position not found for token_id: {token_id}")
@@ -309,12 +348,8 @@ def close_position(
 
     position = positions["open"].pop(position_index)
 
-    # Calculate realized P&L
-    # Entry: amount USDC spent to buy shares at entry_price
-    # Shares = amount / entry_price
-    # Exit value = shares * exit_price
-    # P&L = exit_value - amount
-    shares = position["amount"] / position["entry_price"] if position["entry_price"] > 0 else 0
+    # Calculate realized P&L using helper function
+    shares = calculate_shares(position["amount"], position["entry_price"])
     exit_value = shares * exit_price
     realized_pnl = exit_value - position["amount"]
 
@@ -1177,7 +1212,8 @@ def check_resolved_markets() -> list:
 
         # Check if market is resolved (closed == True or end_date_iso in the past)
         is_closed = market.get("closed", False)
-        resolution_outcome = market.get("resolvedOutcome")  # "yes" or "no"
+        # Gamma API uses camelCase, but check both for compatibility
+        resolution_outcome = market.get("resolvedOutcome") or market.get("resolved_outcome")
 
         if is_closed and resolution_outcome:
             # Market resolved - determine settlement price
@@ -1232,10 +1268,10 @@ def sell_position(position: dict) -> dict:
         mid = clob.get_midpoint(token_id)
         exit_price = float(mid) if mid else 0.5
 
-        # Calculate shares to sell (amount / entry_price)
+        # Calculate shares to sell using helper function
         entry_price = position.get("entry_price", 0)
         amount = position.get("amount", 0)
-        shares = amount / entry_price if entry_price > 0 else 0
+        shares = calculate_shares(amount, entry_price)
 
         if shares <= 0:
             return {"success": False, "error": "No shares to sell"}
@@ -1249,6 +1285,15 @@ def sell_position(position: dict) -> dict:
         )
         signed_order = clob.sign_order(order)
         resp = clob.post_order(signed_order)
+
+        # Check if order was accepted (basic validation)
+        # Note: This is a limit order, so it may not fill immediately
+        # The position is closed optimistically - if order fails to fill,
+        # user should monitor positions manually
+        order_success = resp is not None
+
+        if not order_success:
+            logger.warning(f"Sell order may not have been accepted for token {token_id}")
 
         # Close the position in our store
         market_id = position.get("market_id", "")
@@ -1268,6 +1313,7 @@ def sell_position(position: dict) -> dict:
             "exit_price": exit_price,
             "shares_sold": shares,
             "realized_pnl": closed.get("realized_pnl", 0) if closed else 0,
+            "order_posted": order_success,
         }
 
     except Exception as e:
@@ -1527,6 +1573,9 @@ def bot_loop(send_notification):
                 continue
 
             # Check for prediction flip and exit positions if needed
+            # Note: The "hold" state is skipped earlier, so prediction flip detection
+            # only occurs between "up" and "down" states. Transitions like "up" → "hold" → "down"
+            # won't trigger exits during the "hold" phase, only when a definite direction returns.
             if not bot_config.get("dry_run", True):
                 if previous_prediction is not None and previous_prediction != prediction:
                     logger.info(f"Prediction flipped: {previous_prediction} → {prediction}")
@@ -1912,7 +1961,7 @@ async def positions_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         side = pos.get("side", "?").upper()
         entry_price = pos.get("entry_price", 0)
         amount = pos.get("amount", 0)
-        timestamp = pos.get("timestamp", "")[:10]  # Just the date
+        timestamp = parse_position_date(pos.get("timestamp", ""))
 
         # Try to get current price for P&L calculation
         current_price = entry_price
@@ -1922,7 +1971,7 @@ async def positions_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 mid = clob.get_midpoint(pos.get("token_id", ""))
                 if mid:
                     current_price = float(mid)
-                    shares = amount / entry_price if entry_price > 0 else 0
+                    shares = calculate_shares(amount, entry_price)
                     unrealized_pnl = (current_price - entry_price) * shares
             except Exception:
                 pass
