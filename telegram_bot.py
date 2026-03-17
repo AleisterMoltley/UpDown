@@ -1971,6 +1971,23 @@ def get_current_prediction() -> dict:
 TARGET_CATEGORIES = ["crypto", "politics", "economics"]
 
 
+def get_deviation_emoji(direction: str) -> str:
+    """Get emoji for price deviation direction.
+    
+    Args:
+        direction: 'underpriced', 'overpriced', or 'unknown'
+        
+    Returns:
+        Appropriate emoji: 📉 for underpriced, 📈 for overpriced, ⚖️ for unknown
+    """
+    if direction == "underpriced":
+        return "📉"
+    elif direction == "overpriced":
+        return "📈"
+    else:
+        return "⚖️"
+
+
 def find_relevant_markets(
     query_terms: list | None = None,
     count: int = 8,
@@ -2937,7 +2954,9 @@ def bot_loop(send_notification):
                 historical_mean = price_deviation.get("historical_mean", 0.5)
 
                 # Calculate total confidence (base confidence + deviation bonus)
-                # Deviation bonus: up to 15% extra for high deviation (30%+ deviation = 15% bonus)
+                # Formula: deviation_pct / 2.0, capped at 15%
+                # Example: 30% deviation → 15% bonus (max), 20% deviation → 10% bonus
+                # This rewards trading in highly mispriced markets while limiting risk
                 deviation_bonus = min(15.0, deviation_pct / 2.0)
                 total_confidence = min(100.0, confidence + deviation_bonus)
 
@@ -3365,7 +3384,7 @@ async def markets_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         direction = deviation.get('direction', 'unknown')
         current_price = deviation.get('current_price', 0.5)
 
-        emoji = "📉" if direction == "underpriced" else "📈"
+        emoji = get_deviation_emoji(direction)
 
         text += f"**{i}. {question}...**\n"
         text += f"   {emoji} {direction.upper()} by {abs(dev_pct):.1f}%\n"
@@ -4582,6 +4601,8 @@ async def trade_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     historical_mean = price_deviation.get("historical_mean", 0.5)
 
     # Calculate total confidence with deviation bonus
+    # Formula: deviation_pct / 2.0, capped at 15% (same as bot_loop)
+    # Example: 30% deviation → 15% bonus (max), 20% deviation → 10% bonus
     deviation_bonus = min(15.0, deviation_pct / 2.0)
     total_confidence = min(100.0, base_confidence + deviation_bonus)
 
@@ -4596,7 +4617,7 @@ async def trade_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     context.user_data["trade_market"] = best_market
 
-    emoji = "📉" if direction == "underpriced" else "📈"
+    emoji = get_deviation_emoji(direction)
 
     await update.message.reply_text(
         f"📈 **Manual Trade**\n\n"
@@ -4860,7 +4881,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 deviation = m.get('price_deviation', {})
                 dev_pct = deviation.get('deviation_pct', 0)
                 direction = deviation.get('direction', 'unknown')
-                emoji = "📉" if direction == "underpriced" else "📈"
+                emoji = get_deviation_emoji(direction)
                 text += f"**{i}. {question}...**\n"
                 text += f"   {emoji} {direction.upper()} {abs(dev_pct):.1f}%\n"
                 text += f"   🏷️ {category.capitalize()}\n\n"
