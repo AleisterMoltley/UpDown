@@ -69,6 +69,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 CONFIG_FILE = Path("bot_config.json")
 PNL_FILE = Path("daily_pnl.json")
 POSITIONS_FILE = Path("positions.json")
+RISK_STATE_FILE = Path("risk_state.json")
 
 # Conversation states
 # 100% Onchain Mode: No API credentials needed, only Private Key
@@ -86,7 +87,11 @@ POSITIONS_FILE = Path("positions.json")
     AWAITING_RSI_PERIOD,
     AWAITING_MACD_PARAMS,
     AWAITING_RSI_THRESHOLDS,
-) = range(13)
+    AWAITING_RISK_MAX_DAILY_LOSS,
+    AWAITING_RISK_MAX_POSITION_SIZE,
+    AWAITING_RISK_MAX_CONCURRENT_POSITIONS,
+    AWAITING_RISK_CIRCUIT_BREAKER_LIMIT,
+) = range(17)
 
 # Default configuration
 # 100% Onchain-Modus: Keine API-Credentials mehr benötigt, nur private_key
@@ -129,6 +134,11 @@ DEFAULT_CONFIG = {
     },
     "rsi_overbought": 70,  # RSI overbought threshold
     "rsi_oversold": 30,  # RSI oversold threshold
+    # Risk Management Settings
+    "max_daily_loss": 25.0,  # Maximum daily loss in USD before pausing
+    "max_position_size_pct": 10.0,  # Maximum position size as % of balance
+    "max_concurrent_positions": 5,  # Maximum number of concurrent open positions
+    "circuit_breaker_consecutive_losses": 3,  # Pause after N consecutive losing trades
 }
 
 # Solana USDC token mint address (mainnet)
@@ -272,6 +282,252 @@ def save_positions(positions_data: dict) -> None:
         logger.error(f"Could not save positions: {e}")
 
 
+# ---------------------------------------------------------------------------
+# Risk Management
+# ---------------------------------------------------------------------------
+
+
+def load_risk_state() -> dict:
+    """Load risk management state from file.
+
+    Returns:
+        Dict with 'consecutive_losing_trades' (int) and 'circuit_breaker_paused' (bool).
+    """
+    if RISK_STATE_FILE.exists():
+        try:
+            with open(RISK_STATE_FILE, "r") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return {"consecutive_losing_trades": 0, "circuit_breaker_paused": False}
+    return {"consecutive_losing_trades": 0, "circuit_breaker_paused": False}
+
+
+def save_risk_state(risk_state: dict) -> None:
+    """Save risk management state to file."""
+    try:
+        with open(RISK_STATE_FILE, "w") as f:
+            json.dump(risk_state, f, indent=2)
+    except OSError as e:
+        logger.error(f"Could not save risk state: {e}")
+
+
+def get_daily_loss() -> float:
+    """Get today's total loss (negative profit).
+
+    Returns:
+        Today's loss as a positive number (0 if profitable or no trades).
+    """
+    pnl = load_pnl()
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    daily_profit = pnl.get("daily", {}).get(today, {}).get("profit", 0.0)
+    # Return loss as positive number (0 if profitable)
+    return max(0.0, -daily_profit)
+
+
+def get_position_count() -> int:
+    """Get the count of current open positions.
+
+    Returns:
+        Number of open positions.
+    """
+    positions = load_positions()
+    return len(positions.get("open", []))
+
+
+def get_positions_for_market(market_id: str) -> list:
+    """Get all open positions for a specific market.
+
+    Args:
+        market_id: The market ID to check.
+
+    Returns:
+        List of positions for the market.
+    """
+    positions = load_positions()
+    return [p for p in positions.get("open", []) if p.get("market_id") == market_id]
+
+
+def check_risk_limits(
+    trade_amount: float = 0.0,
+    market_id: str = "",
+    send_alert: callable = None,
+) -> dict:
+    """Check all risk limits before executing a trade.
+
+    Args:
+        trade_amount: The amount to trade in USD.
+        market_id: The market ID for position size check.
+        send_alert: Optional callback function to send Telegram alerts.
+
+    Returns:
+        Dict with 'allowed' (bool) and 'reason' (str if blocked).
+    """
+    risk_state = load_risk_state()
+
+    # 1. Check circuit breaker
+    if risk_state.get("circuit_breaker_paused", False):
+        consecutive = risk_state.get("consecutive_losing_trades", 0)
+        limit = bot_config.get("circuit_breaker_consecutive_losses", 3)
+        reason = (
+            f"Circuit breaker activated after {consecutive} consecutive losing trades. "
+            f"Use /risk reset to resume trading."
+        )
+        if send_alert:
+            send_alert(
+                f"⚠️ **Risk Limit Hit: Circuit Breaker**\n\n"
+                f"Trading paused after {consecutive} consecutive losing trades.\n"
+                f"Limit: {limit} consecutive losses\n\n"
+                f"Use /risk reset to resume trading."
+            )
+        return {"allowed": False, "reason": reason}
+
+    # 2. Check max daily loss
+    daily_loss = get_daily_loss()
+    max_daily_loss = bot_config.get("max_daily_loss", 25.0)
+    if daily_loss >= max_daily_loss:
+        reason = f"Daily loss limit reached: ${daily_loss:.2f} (max: ${max_daily_loss:.2f})"
+        if send_alert:
+            send_alert(
+                f"🛑 **Risk Limit Hit: Daily Loss**\n\n"
+                f"Today's loss: ${daily_loss:.2f}\n"
+                f"Limit: ${max_daily_loss:.2f}\n\n"
+                f"Trading paused for today."
+            )
+        return {"allowed": False, "reason": reason}
+
+    # 3. Check max concurrent positions
+    position_count = get_position_count()
+    max_positions = bot_config.get("max_concurrent_positions", 5)
+    if position_count >= max_positions:
+        reason = f"Max concurrent positions reached: {position_count} (max: {max_positions})"
+        if send_alert:
+            send_alert(
+                f"⚠️ **Risk Limit Hit: Max Positions**\n\n"
+                f"Open positions: {position_count}\n"
+                f"Limit: {max_positions}\n\n"
+                f"Close some positions before opening new ones."
+            )
+        return {"allowed": False, "reason": reason}
+
+    # 4. Check max position size per market (as % of balance)
+    if trade_amount > 0:
+        balance = get_polygon_balance()
+        max_position_pct = bot_config.get("max_position_size_pct", 10.0)
+        max_position_amount = balance * (max_position_pct / 100.0) if balance > 0 else 0
+
+        # Calculate existing position amount for this market
+        existing_position_amount = 0.0
+        if market_id:
+            market_positions = get_positions_for_market(market_id)
+            existing_position_amount = sum(p.get("amount", 0) for p in market_positions)
+
+        total_market_position = existing_position_amount + trade_amount
+
+        if balance > 0 and total_market_position > max_position_amount:
+            reason = (
+                f"Position size limit reached for market: "
+                f"${total_market_position:.2f} (max: ${max_position_amount:.2f} = {max_position_pct}% of ${balance:.2f})"
+            )
+            if send_alert:
+                send_alert(
+                    f"⚠️ **Risk Limit Hit: Position Size**\n\n"
+                    f"Requested: ${trade_amount:.2f}\n"
+                    f"Existing in market: ${existing_position_amount:.2f}\n"
+                    f"Total would be: ${total_market_position:.2f}\n"
+                    f"Max allowed: ${max_position_amount:.2f} ({max_position_pct}% of balance)\n"
+                    f"Balance: ${balance:.2f}"
+                )
+            return {"allowed": False, "reason": reason}
+
+    return {"allowed": True, "reason": ""}
+
+
+def record_trade_result(is_win: bool, send_alert: callable = None) -> None:
+    """Record a trade result for circuit breaker tracking.
+
+    Args:
+        is_win: True if trade was profitable, False if it was a loss.
+        send_alert: Optional callback function to send Telegram alerts.
+    """
+    risk_state = load_risk_state()
+
+    if is_win:
+        # Reset consecutive losses on a win
+        risk_state["consecutive_losing_trades"] = 0
+    else:
+        # Increment consecutive losses
+        risk_state["consecutive_losing_trades"] = risk_state.get("consecutive_losing_trades", 0) + 1
+
+        # Check if circuit breaker should activate
+        consecutive = risk_state["consecutive_losing_trades"]
+        limit = bot_config.get("circuit_breaker_consecutive_losses", 3)
+
+        if consecutive >= limit and not risk_state.get("circuit_breaker_paused", False):
+            risk_state["circuit_breaker_paused"] = True
+            logger.warning(f"Circuit breaker activated after {consecutive} consecutive losses")
+            if send_alert:
+                send_alert(
+                    f"🚨 **Circuit Breaker Activated**\n\n"
+                    f"Bot has been paused after {consecutive} consecutive losing trades.\n"
+                    f"Limit: {limit} consecutive losses\n\n"
+                    f"Use /risk reset to resume trading after reviewing strategy."
+                )
+
+    save_risk_state(risk_state)
+
+
+def reset_circuit_breaker() -> dict:
+    """Reset the circuit breaker and consecutive loss counter.
+
+    Returns:
+        Dict with 'success' (bool) and 'message' (str).
+    """
+    risk_state = load_risk_state()
+    was_paused = risk_state.get("circuit_breaker_paused", False)
+    consecutive = risk_state.get("consecutive_losing_trades", 0)
+
+    risk_state["circuit_breaker_paused"] = False
+    risk_state["consecutive_losing_trades"] = 0
+    save_risk_state(risk_state)
+
+    if was_paused:
+        return {
+            "success": True,
+            "message": f"Circuit breaker reset. Was paused after {consecutive} consecutive losses.",
+        }
+    return {
+        "success": True,
+        "message": "Circuit breaker was not paused. Counter reset to 0.",
+    }
+
+
+def get_risk_status() -> dict:
+    """Get the current risk management status.
+
+    Returns:
+        Dict with all risk-related metrics.
+    """
+    risk_state = load_risk_state()
+    pnl = load_pnl()
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    daily_data = pnl.get("daily", {}).get(today, {"trades": 0, "profit": 0.0})
+
+    return {
+        # Configured limits
+        "max_daily_loss": bot_config.get("max_daily_loss", 25.0),
+        "max_position_size_pct": bot_config.get("max_position_size_pct", 10.0),
+        "max_concurrent_positions": bot_config.get("max_concurrent_positions", 5),
+        "circuit_breaker_limit": bot_config.get("circuit_breaker_consecutive_losses", 3),
+        # Current state
+        "daily_loss": get_daily_loss(),
+        "daily_profit": daily_data.get("profit", 0.0),
+        "daily_trades": daily_data.get("trades", 0),
+        "open_positions": get_position_count(),
+        "consecutive_losses": risk_state.get("consecutive_losing_trades", 0),
+        "circuit_breaker_paused": risk_state.get("circuit_breaker_paused", False),
+    }
+
+
 def calculate_shares(amount: float, entry_price: float) -> float:
     """Calculate the number of shares from amount and entry price.
 
@@ -345,6 +601,7 @@ def close_position(
     token_id: str,
     exit_price: float,
     resolution: str | None = None,
+    send_alert: callable = None,
 ) -> dict | None:
     """Close an open position and calculate realized P&L.
 
@@ -353,6 +610,7 @@ def close_position(
         token_id: The token ID.
         exit_price: The exit/settlement price per share.
         resolution: Optional resolution outcome ('yes', 'no', or None for manual exit).
+        send_alert: Optional callback function to send Telegram alerts.
 
     Returns:
         The closed position dict with realized_pnl, or None if not found.
@@ -394,6 +652,10 @@ def close_position(
     positions["closed"].append(position)
     positions["closed"] = positions["closed"][-100:]
     save_positions(positions)
+
+    # Record trade result for circuit breaker tracking
+    is_win = realized_pnl >= 0
+    record_trade_result(is_win, send_alert)
 
     logger.info(
         f"Closed position: {position['side'].upper()} exit at ${exit_price:.4f}, "
@@ -1717,8 +1979,38 @@ def find_relevant_markets(query_terms: list | None = None) -> list:
     return relevant
 
 
-def place_trade(market: dict, outcome: str = "yes", amount: float = 10.0) -> dict:
-    """Place a limit order on a Polymarket market."""
+def place_trade(
+    market: dict,
+    outcome: str = "yes",
+    amount: float = 10.0,
+    send_alert: callable = None,
+    skip_risk_check: bool = False,
+) -> dict:
+    """Place a limit order on a Polymarket market.
+
+    Args:
+        market: The market dict with tokens.
+        outcome: 'yes' or 'no'.
+        amount: The amount in USDC to trade.
+        send_alert: Optional callback function to send Telegram alerts.
+        skip_risk_check: If True, skip risk limit checks (for internal use).
+
+    Returns:
+        Dict with 'success' (bool), 'error' (str on failure), and order details on success.
+    """
+    # Get market ID for risk check
+    market_id = market.get("id") or market.get("condition_id") or ""
+
+    # Check risk limits before trading (unless explicitly skipped)
+    if not skip_risk_check:
+        risk_check = check_risk_limits(
+            trade_amount=amount,
+            market_id=market_id,
+            send_alert=send_alert,
+        )
+        if not risk_check.get("allowed", True):
+            return {"success": False, "error": risk_check.get("reason", "Risk limit reached")}
+
     clob = _build_clob_client()
     if clob is None:
         return {"success": False, "error": "CLOB client not initialized"}
@@ -1748,7 +2040,6 @@ def place_trade(market: dict, outcome: str = "yes", amount: float = 10.0) -> dic
         record_trade(amount)
 
         # Record the position for tracking
-        market_id = market.get("id") or market.get("condition_id") or ""
         market_question = market.get("question", "")
         add_position(
             market_id=market_id,
@@ -1788,8 +2079,11 @@ def get_market_by_id(market_id: str) -> dict | None:
         return None
 
 
-def check_resolved_markets() -> list:
+def check_resolved_markets(send_alert: callable = None) -> list:
     """Check open positions for resolved markets and calculate realized P&L.
+
+    Args:
+        send_alert: Optional callback function to send Telegram alerts.
 
     Returns:
         List of closed position results with P&L info.
@@ -1831,6 +2125,7 @@ def check_resolved_markets() -> list:
                 token_id=token_id,
                 exit_price=exit_price,
                 resolution=resolution_outcome,
+                send_alert=send_alert,
             )
 
             if closed:
@@ -2155,7 +2450,7 @@ def bot_loop(send_notification):
             # Check for resolved markets and auto-calculate P&L
             if not bot_config.get("dry_run", True):
                 try:
-                    resolved = check_resolved_markets()
+                    resolved = check_resolved_markets(send_alert=send_notification)
                     for result in resolved:
                         pos = result.get("position", {})
                         send_notification(
@@ -2224,6 +2519,18 @@ def bot_loop(send_notification):
                 wait_with_check(bot_config.get("cycle_interval_seconds", 300))
                 continue
 
+            # Check risk limits before looking for markets (for live trading only)
+            if not bot_config.get("dry_run", True):
+                trade_amount = bot_config.get("trade_amount", 5.0)
+                risk_check = check_risk_limits(
+                    trade_amount=trade_amount,
+                    send_alert=send_notification,
+                )
+                if not risk_check.get("allowed", True):
+                    logger.info(f"Risk limit hit: {risk_check.get('reason', 'Unknown')}")
+                    wait_with_check(bot_config.get("cycle_interval_seconds", 300))
+                    continue
+
             # Find markets
             markets = find_relevant_markets()
 
@@ -2255,7 +2562,12 @@ def bot_loop(send_notification):
                 else:
                     outcome = "yes" if prediction == "up" else "no"
                     trade_amount = bot_config.get("trade_amount", 5.0)
-                    result = place_trade(market, outcome=outcome, amount=trade_amount)
+                    result = place_trade(
+                        market,
+                        outcome=outcome,
+                        amount=trade_amount,
+                        send_alert=send_notification,
+                    )
 
                     if result.get("success"):
                         send_notification(
@@ -2328,7 +2640,10 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             InlineKeyboardButton("📜 P&L", callback_data="pnl"),
             InlineKeyboardButton("📊 Positions", callback_data="positions"),
         ],
-        [InlineKeyboardButton("❓ Hilfe", callback_data="help")],
+        [
+            InlineKeyboardButton("🛡️ Risk", callback_data="risk"),
+            InlineKeyboardButton("❓ Hilfe", callback_data="help"),
+        ],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -2336,10 +2651,15 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     mode = "🧪 Dry Run" if bot_config.get("dry_run", True) else "💰 Live"
     onchain = "⛓️ 100% Onchain"
 
+    # Check risk status
+    risk_state = load_risk_state()
+    risk_status = "🔴 PAUSED" if risk_state.get("circuit_breaker_paused") else "🟢 OK"
+
     await update.message.reply_text(
         f"🎰 **UpDown Trading Bot**\n\n"
         f"Status: {status}\n"
-        f"Modus: {mode} | {onchain}\n\n"
+        f"Modus: {mode} | {onchain}\n"
+        f"Risk: {risk_status}\n\n"
         f"Steuere deinen Polymarket Prediction Bot komplett via Telegram.\n\n"
         f"Wähle eine Option:",
         reply_markup=reply_markup,
@@ -2381,6 +2701,15 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 **Position Tracking:**
 /positions - Offene Positionen anzeigen 📊
   (Auto-Exit bei Prediction-Flip, Auto-P&L bei Resolution)
+
+**Risk Management:** 🛡️
+/risk - Risiko-Status anzeigen
+/risk reset - Circuit Breaker zurücksetzen
+/risk set max_daily_loss <USD> - Max. Tagesverlust
+/risk set max_position_size <PCT> - Max. Position (% Balance)
+/risk set max_positions <N> - Max. gleichzeitige Positionen
+/risk set circuit_breaker <N> - Pause nach N Verlusten
+/risk help - Risiko-Hilfe
 
 **Configuration:**
 /config - Einstellungen anzeigen/ändern
@@ -2793,6 +3122,9 @@ async def config_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             InlineKeyboardButton("📈 MACD", callback_data="cfg_macd"),
             InlineKeyboardButton("🧪 Toggle Dry Run", callback_data="toggle_dry_run"),
         ],
+        [
+            InlineKeyboardButton("🛡️ Risk Settings", callback_data="risk"),
+        ],
         [InlineKeyboardButton("« Back", callback_data="back_main")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -2833,6 +3165,12 @@ Oversold: {bot_config.get('rsi_oversold', 30)}
 Fast: {bot_config.get('macd_fast_period', 12)}
 Slow: {bot_config.get('macd_slow_period', 26)}
 Signal: {bot_config.get('macd_signal_period', 9)}
+
+**Risk Management:** 🛡️
+Max Daily Loss: ${bot_config.get('max_daily_loss', 25.0)}
+Max Position Size: {bot_config.get('max_position_size_pct', 10.0)}% of balance
+Max Concurrent Positions: {bot_config.get('max_concurrent_positions', 5)}
+Circuit Breaker: {bot_config.get('circuit_breaker_consecutive_losses', 3)} consecutive losses
 
 **Auto-Fund:**
 Min Polygon Balance: ${bot_config.get('min_poly_balance_usdc', 20.0)}
@@ -3659,8 +3997,165 @@ async def trade_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 # ---------------------------------------------------------------------------
-# Callback Query Handler
+# Risk Management Command Handler
 # ---------------------------------------------------------------------------
+
+
+async def risk_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /risk command for viewing and configuring risk management."""
+    if not is_authorized(update):
+        await unauthorized_response(update)
+        return
+
+    args = context.args if context.args else []
+
+    # Handle subcommands
+    if args:
+        subcommand = args[0].lower()
+
+        if subcommand == "reset":
+            # Reset circuit breaker
+            result = reset_circuit_breaker()
+            await update.message.reply_text(
+                f"🔄 **Circuit Breaker Reset**\n\n{result.get('message', 'Reset complete.')}",
+                parse_mode="Markdown",
+            )
+            return
+
+        elif subcommand == "set" and len(args) >= 3:
+            # Set a risk parameter: /risk set <param> <value>
+            param = args[1].lower()
+            try:
+                value = float(args[2])
+            except ValueError:
+                await update.message.reply_text(
+                    "❌ Invalid value. Please provide a number.",
+                    parse_mode="Markdown",
+                )
+                return
+
+            if param in ("max_daily_loss", "daily_loss"):
+                if value < 0:
+                    await update.message.reply_text("❌ Value must be positive.")
+                    return
+                bot_config["max_daily_loss"] = value
+                save_config()
+                await update.message.reply_text(
+                    f"✅ Max daily loss set to: ${value:.2f}",
+                    parse_mode="Markdown",
+                )
+                return
+
+            elif param in ("max_position_size", "position_size", "position_pct"):
+                if value < 0 or value > 100:
+                    await update.message.reply_text("❌ Value must be between 0 and 100.")
+                    return
+                bot_config["max_position_size_pct"] = value
+                save_config()
+                await update.message.reply_text(
+                    f"✅ Max position size set to: {value:.1f}% of balance",
+                    parse_mode="Markdown",
+                )
+                return
+
+            elif param in ("max_positions", "max_concurrent", "concurrent"):
+                if value < 1:
+                    await update.message.reply_text("❌ Value must be at least 1.")
+                    return
+                bot_config["max_concurrent_positions"] = int(value)
+                save_config()
+                await update.message.reply_text(
+                    f"✅ Max concurrent positions set to: {int(value)}",
+                    parse_mode="Markdown",
+                )
+                return
+
+            elif param in ("circuit_breaker", "consecutive_losses", "cb_limit"):
+                if value < 1:
+                    await update.message.reply_text("❌ Value must be at least 1.")
+                    return
+                bot_config["circuit_breaker_consecutive_losses"] = int(value)
+                save_config()
+                await update.message.reply_text(
+                    f"✅ Circuit breaker limit set to: {int(value)} consecutive losses",
+                    parse_mode="Markdown",
+                )
+                return
+
+            else:
+                await update.message.reply_text(
+                    "❌ Unknown parameter. Valid parameters:\n"
+                    "• max_daily_loss\n"
+                    "• max_position_size\n"
+                    "• max_positions\n"
+                    "• circuit_breaker",
+                    parse_mode="Markdown",
+                )
+                return
+
+        elif subcommand == "help":
+            await update.message.reply_text(
+                "🛡️ **Risk Management Help**\n\n"
+                "**View Status:**\n"
+                "`/risk` - Show current risk status\n\n"
+                "**Reset Circuit Breaker:**\n"
+                "`/risk reset` - Reset and resume trading\n\n"
+                "**Configure Limits:**\n"
+                "`/risk set max_daily_loss <amount>` - Set max daily loss in USD\n"
+                "`/risk set max_position_size <pct>` - Set max position size (% of balance)\n"
+                "`/risk set max_positions <count>` - Set max concurrent positions\n"
+                "`/risk set circuit_breaker <count>` - Set consecutive losses before pause\n\n"
+                "**Examples:**\n"
+                "`/risk set max_daily_loss 50`\n"
+                "`/risk set max_position_size 15`\n"
+                "`/risk set max_positions 3`\n"
+                "`/risk set circuit_breaker 5`",
+                parse_mode="Markdown",
+            )
+            return
+
+        else:
+            await update.message.reply_text(
+                "❌ Unknown subcommand. Use `/risk help` for available commands.",
+                parse_mode="Markdown",
+            )
+            return
+
+    # Default: show risk status
+    status = get_risk_status()
+
+    # Format status indicators
+    cb_status = "🔴 PAUSED" if status["circuit_breaker_paused"] else "🟢 Active"
+    daily_loss_status = "🔴" if status["daily_loss"] >= status["max_daily_loss"] else "🟢"
+    positions_status = "🔴" if status["open_positions"] >= status["max_concurrent_positions"] else "🟢"
+
+    # Calculate position size limit
+    balance = get_polygon_balance()
+    max_position_amount = balance * (status["max_position_size_pct"] / 100.0) if balance > 0 else 0
+
+    text = f"""
+🛡️ **Risk Management Status**
+
+**Circuit Breaker:** {cb_status}
+Consecutive Losses: {status['consecutive_losses']} / {status['circuit_breaker_limit']}
+
+**Daily Loss Limit:** {daily_loss_status}
+Today's Loss: ${status['daily_loss']:.2f} / ${status['max_daily_loss']:.2f}
+Today's P&L: ${status['daily_profit']:.2f} ({status['daily_trades']} trades)
+
+**Position Limits:** {positions_status}
+Open Positions: {status['open_positions']} / {status['max_concurrent_positions']}
+Max Position Size: {status['max_position_size_pct']:.1f}% (${max_position_amount:.2f})
+
+**Configure:**
+`/risk set max_daily_loss <amount>`
+`/risk set max_position_size <pct>`
+`/risk set max_positions <count>`
+`/risk set circuit_breaker <count>`
+`/risk reset` - Reset circuit breaker
+`/risk help` - Show help
+"""
+    await update.message.reply_text(text, parse_mode="Markdown")
 
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3924,6 +4419,44 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         keyboard = [[InlineKeyboardButton("« Back", callback_data="back_main")]]
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
+    elif data == "risk":
+        # Show risk management status
+        status = get_risk_status()
+
+        # Format status indicators
+        cb_status = "🔴 PAUSED" if status["circuit_breaker_paused"] else "🟢 Active"
+        daily_loss_status = "🔴" if status["daily_loss"] >= status["max_daily_loss"] else "🟢"
+        positions_status = "🔴" if status["open_positions"] >= status["max_concurrent_positions"] else "🟢"
+
+        # Calculate position size limit
+        balance = get_polygon_balance()
+        max_position_amount = balance * (status["max_position_size_pct"] / 100.0) if balance > 0 else 0
+
+        text = (
+            f"🛡️ **Risk Management**\n\n"
+            f"**Circuit Breaker:** {cb_status}\n"
+            f"Consecutive Losses: {status['consecutive_losses']} / {status['circuit_breaker_limit']}\n\n"
+            f"**Daily Loss:** {daily_loss_status}\n"
+            f"Today: ${status['daily_loss']:.2f} / ${status['max_daily_loss']:.2f}\n\n"
+            f"**Positions:** {positions_status}\n"
+            f"Open: {status['open_positions']} / {status['max_concurrent_positions']}\n"
+            f"Max Size: {status['max_position_size_pct']:.0f}% (${max_position_amount:.2f})\n\n"
+            f"Use /risk for configuration."
+        )
+
+        keyboard = [
+            [InlineKeyboardButton("🔄 Reset CB", callback_data="risk_reset")],
+            [InlineKeyboardButton("« Back", callback_data="back_main")],
+        ]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+    elif data == "risk_reset":
+        result = reset_circuit_breaker()
+        text = f"🔄 **Circuit Breaker Reset**\n\n{result.get('message', 'Reset complete.')}"
+
+        keyboard = [[InlineKeyboardButton("« Back", callback_data="risk")]]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
     elif data == "toggle_dry_run":
         current = bot_config.get("dry_run", True)
 
@@ -4173,6 +4706,8 @@ def main() -> None:
     application.add_handler(CommandHandler("setup_approvals", setup_approvals_command))
     application.add_handler(CommandHandler("gas_status", gas_status_command))
     application.add_handler(CommandHandler("toggle_onchain", toggle_onchain_command))
+    # Risk management command
+    application.add_handler(CommandHandler("risk", risk_command))
 
     # Add conversation handlers
     application.add_handler(solana_conv)
