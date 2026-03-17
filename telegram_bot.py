@@ -4067,7 +4067,7 @@ async def politics_scan_command(update: Update, context: ContextTypes.DEFAULT_TY
         lines.append("_Filters: vol24h > $150k, settlement < 48h_\n")
 
         for i, market in enumerate(mispriced, 1):
-            question = market.get("question", "Unknown")[:55]
+            question = market.get("question", "Unknown")[:60]
             category = market.get("category", "other")
             deviation = market.get("price_deviation", {})
 

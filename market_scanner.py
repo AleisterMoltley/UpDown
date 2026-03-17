@@ -193,7 +193,7 @@ def _get_market_volume_24h(market: dict) -> float:
     if not volume_24h:
         # Fallback: sum token 24h volumes if available
         tokens = market.get("tokens", [])
-        volume_24h = sum(float(t.get("volume24hr", 0) or t.get("volume24h", 0) or 0) for t in tokens)
+        volume_24h = sum(float(t.get("volume24hr") or t.get("volume24h") or 0) for t in tokens)
 
     return float(volume_24h) if volume_24h else 0.0
 
@@ -423,6 +423,7 @@ def get_top_mispriced_markets(
             end_date = _get_market_end_date(m)
             if end_date is not None:
                 hours_to_settlement = (end_date - now).total_seconds() / 3600
+                # Skip already settled (negative) or too far in future markets
                 if hours_to_settlement < 0 or hours_to_settlement > max_hours_to_settlement:
                     continue
             # If no end_date available, exclude if filter is active
