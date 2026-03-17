@@ -1441,6 +1441,14 @@ AGREEMENT_BONUS_PER_SIGNAL = 10  # Confidence bonus per agreeing signal
 # Logistic Regression constants
 LOGREG_TRAINING_DAYS = 7  # Days of historical data for training
 LOGREG_FEATURE_WINDOW = 14  # Minimum data points needed for feature calculation
+LOGREG_MIN_TRAINING_SAMPLES = 20  # Minimum samples required for reliable model training
+LOGREG_AGREEMENT_BONUS_CAP = 5  # Maximum bonus (%) for LogReg agreement with main prediction
+# Confidence bonus formula: (logreg_confidence - 50) / 10
+# - 50 is the neutral point (50% probability = no directional confidence)
+# - Division by 10 scales the bonus to 0-5% range (e.g., 100% confidence → 5% bonus)
+
+# Polymarket deviation scaling
+POLYMARKET_DEVIATION_STRENGTH_SCALE = 5  # Scaling factor: 20% deviation = 100% strength
 
 
 def sigmoid(x: float) -> float:
@@ -1458,13 +1466,16 @@ def sigmoid(x: float) -> float:
 
 
 def fetch_7day_historical_data(crypto_id: str = "bitcoin") -> list | None:
-    """Fetch 7 days of hourly OHLC data from CoinGecko for model training.
+    """Fetch 7 days of price data from CoinGecko for model training.
+    
+    Note: CoinGecko's market_chart endpoint returns only price data, not true OHLC.
+    We simulate OHLC format for compatibility, with all values being the same price.
     
     Args:
         crypto_id: Cryptocurrency ID for CoinGecko API.
     
     Returns:
-        List of [timestamp, open, high, low, close] or None on error.
+        List of [timestamp, price, price, price, price] (simulated OHLC) or None on error.
     """
     try:
         # CoinGecko returns hourly data when days <= 90
@@ -1477,7 +1488,8 @@ def fetch_7day_historical_data(crypto_id: str = "bitcoin") -> list | None:
         if not data or "prices" not in data:
             return None
         
-        # Convert to OHLC-like format (only have prices, simulate with same value)
+        # Convert to OHLC-like format (CoinGecko market_chart only provides prices, not true OHLC)
+        # All OHLC values are identical as we only have the spot price at each timestamp
         prices = data.get("prices", [])
         return [[p[0], p[1], p[1], p[1], p[1]] for p in prices]
     except Exception as e:
@@ -1511,8 +1523,14 @@ def prepare_logreg_features(closes: list) -> np.ndarray | None:
         macd_data = calculate_macd(closes)
         if macd_data.get("valid"):
             hist = macd_data["histogram"]
-            # Normalize to roughly -1 to 1 range
-            current_price = closes[-1] if closes[-1] > 0 else 1
+            # Use mean of recent non-zero prices as fallback for normalization
+            recent_prices = [p for p in closes[-20:] if p > 0]
+            if recent_prices:
+                current_price = recent_prices[-1]
+            else:
+                # No valid prices - return None to signal insufficient data
+                return None
+            # Normalize to roughly -1 to 1 range relative to 1% of price
             normalized_hist = np.clip(hist / (current_price * 0.01), -1, 1)
         else:
             normalized_hist = 0.0
@@ -1628,8 +1646,8 @@ def get_logreg_model() -> dict | None:
                 # Label: 1 if next price is higher, 0 otherwise
                 y_list.append(1 if closes[i + 1] > closes[i] else 0)
         
-        if len(X_list) < 20:  # Need at least 20 samples
-            logger.warning("Not enough training samples for LogReg")
+        if len(X_list) < LOGREG_MIN_TRAINING_SAMPLES:
+            logger.warning(f"Not enough training samples for LogReg (need {LOGREG_MIN_TRAINING_SAMPLES}, have {len(X_list)})")
             return None
         
         X = np.array(X_list)
@@ -2082,18 +2100,22 @@ def calculate_confidence(closes: list, market_price_deviation: float | None = No
         # Positive deviation = market underpriced = bullish
         # Negative deviation = market overpriced = bearish
         pm_direction = "up" if market_price_deviation > 0 else "down" if market_price_deviation < 0 else "neutral"
-        pm_strength = min(100, abs(market_price_deviation) * 5)  # Scale: 20% deviation = 100% strength
+        # Scale strength: using POLYMARKET_DEVIATION_STRENGTH_SCALE (5 = 20% deviation → 100% strength)
+        pm_strength = min(100, abs(market_price_deviation) * POLYMARKET_DEVIATION_STRENGTH_SCALE)
         polymarket_signal = {
             "direction": pm_direction,
             "strength": pm_strength,
             "delta": market_price_deviation / 100,  # Convert to decimal
             "deviation_pct": market_price_deviation,
         }
+        # Store actual market_price for return value
+        pm_market_price = 0.5 + (market_price_deviation / 200)  # Estimate: 50% ± deviation/2
     else:
         # Fallback: get Polymarket price delta from market data
         polymarket_data = get_polymarket_price_delta(market)
         polymarket_data["fair_value"] = technical_fair_value
         polymarket_data["delta"] = technical_fair_value - polymarket_data["market_price"]
+        pm_market_price = polymarket_data["market_price"]
         
         polymarket_signal = calculate_polymarket_delta_signal(
             polymarket_data["market_price"],
@@ -2118,14 +2140,15 @@ def calculate_confidence(closes: list, market_price_deviation: float | None = No
             "confidence": logreg_pred["confidence"],
             "probability": logreg_pred["probability"],
         }
-        # If LogReg agrees with main prediction, add small confidence bonus (up to 5%)
+        # If LogReg agrees with main prediction, add small confidence bonus
         # This serves as a confirmation signal
-        logreg_bonus_cap = 5
+        # Formula: bonus = (confidence - 50) / 10, capped at LOGREG_AGREEMENT_BONUS_CAP
+        # - 50 is neutral (50% probability = no directional confidence)
+        # - Division by 10 scales to 0-5% range (e.g., 100% confidence → 5% bonus)
         if logreg_pred["confidence"] > 60:  # Only if LogReg is confident
             if (logreg_pred["direction"] == "up" and up_score > down_score) or \
                (logreg_pred["direction"] == "down" and down_score > up_score):
-                agreement_factor = min(logreg_bonus_cap, (logreg_pred["confidence"] - 50) / 10)
-                # We'll add this after calculating base confidence
+                agreement_factor = min(LOGREG_AGREEMENT_BONUS_CAP, (logreg_pred["confidence"] - 50) / 10)
             else:
                 agreement_factor = 0
         else:
@@ -2186,7 +2209,7 @@ def calculate_confidence(closes: list, market_price_deviation: float | None = No
             "polymarket_delta": polymarket_signal,
         },
         "fair_value": technical_fair_value,
-        "polymarket_price": polymarket_signal.get("delta", 0) + 0.5 if market_price_deviation else 0.5,
+        "polymarket_price": pm_market_price,
         "up_score": up_score,
         "down_score": down_score,
         "logreg_prediction": logreg_signal,
