@@ -42,13 +42,74 @@ from telegram.ext import (
 
 # Import market scanner module
 from market_scanner import (
+    CATEGORY_KEYWORDS,
+    categorize_market,
+    calculate_price_deviation,
+    fetch_all_active_markets,
     format_scan_results,
     get_category_summary,
+    get_top_mispriced_markets,
     scan_all_markets,
 )
 
 # Load environment variables from .env file
 load_dotenv()
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+# Text truncation lengths for consistent display
+MARKET_QUESTION_TRUNCATE_LENGTH = 60
+
+# Deviation confidence bonus multiplier (0.5 = deviation_pct adds up to 50% bonus)
+DEVIATION_CONFIDENCE_MULTIPLIER = 0.5
+
+# Maximum total confidence value
+MAX_CONFIDENCE = 100.0
+
+# ---------------------------------------------------------------------------
+# Helper Functions
+# ---------------------------------------------------------------------------
+
+
+def calculate_total_confidence(base_confidence: float, deviation_pct: float) -> float:
+    """Calculate total trading confidence including deviation bonus.
+    
+    The deviation percentage from historical mean adds extra confidence
+    to the trade decision. A higher deviation suggests a more significant
+    mispricing opportunity.
+    
+    Args:
+        base_confidence: Base confidence from multi-signal analysis (0-100).
+        deviation_pct: Absolute price deviation percentage from historical mean.
+    
+    Returns:
+        Total confidence capped at MAX_CONFIDENCE (100%).
+    
+    Example:
+        - base_confidence=70%, deviation_pct=20% → 70 + (20 * 0.5) = 80%
+        - base_confidence=80%, deviation_pct=50% → 80 + (50 * 0.5) = 105% → capped to 100%
+    """
+    bonus = abs(deviation_pct) * DEVIATION_CONFIDENCE_MULTIPLIER
+    total = base_confidence + bonus
+    return min(MAX_CONFIDENCE, total)
+
+
+def truncate_question(question: str, max_length: int = MARKET_QUESTION_TRUNCATE_LENGTH) -> str:
+    """Truncate market question text for display.
+    
+    Args:
+        question: The market question text.
+        max_length: Maximum length before truncation.
+    
+    Returns:
+        Truncated question with '...' suffix if needed.
+    """
+    if len(question) <= max_length:
+        return question
+    return question[:max_length] + "..."
+
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -1964,29 +2025,80 @@ def get_current_prediction() -> dict:
 # ---------------------------------------------------------------------------
 
 
-def find_relevant_markets(query_terms: list | None = None) -> list:
-    """Search Polymarket's public Gamma API for active markets."""
-    if query_terms is None:
-        query_terms = bot_config.get("query_terms", ["BTC"])
-        today = datetime.now(timezone.utc).strftime("%B %d").lower()
-        query_terms = query_terms + [today]
-
-    url = f"{GAMMA_API_BASE}/markets"
-    params = {"active": "true", "closed": "false", "limit": 100}
-
+def find_relevant_markets(
+    count: int = 8,
+    min_deviation_pct: float = 12.0,
+    categories: list[str] | None = None,
+) -> list:
+    """Find the top mispriced markets across all categories.
+    
+    This function replaces the old BTC-daily search with a comprehensive
+    market scanner that finds the most mispriced markets based on price
+    deviation from historical mean.
+    
+    Args:
+        count: Number of top markets to return (default: 8).
+        min_deviation_pct: Minimum price deviation percentage (default: 12.0).
+        categories: Optional list of categories to filter by (e.g., ['crypto', 'politics', 'economics']).
+                   If None, returns markets from all categories.
+    
+    Returns:
+        List of top mispriced markets sorted by absolute deviation.
+    """
     try:
-        response = requests.get(url, params=params, timeout=15)
-        response.raise_for_status()
-    except requests.RequestException as e:
-        logger.error(f"Error fetching markets: {e}")
+        # When filtering by categories, fetch more markets to ensure we have enough
+        # after filtering. We use 4x multiplier to be safe, as typically only
+        # ~25-40% of markets match crypto/politics/economics categories.
+        fetch_count = count * 4 if categories else count
+        
+        # Get top mispriced markets using the new scanner
+        markets = get_top_mispriced_markets(
+            count=fetch_count,
+            min_deviation_pct=min_deviation_pct,
+        )
+        
+        if not markets:
+            logger.info("No mispriced markets found with current criteria")
+            return []
+        
+        # Filter by categories if specified
+        if categories:
+            filtered = [
+                m for m in markets
+                if m.get("category", "other") in categories
+            ]
+            if not filtered:
+                logger.info(f"No markets found in categories: {categories}")
+            return filtered[:count]
+        
+        return markets[:count]
+        
+    except Exception as e:
+        logger.error(f"Error finding relevant markets: {e}")
         return []
 
-    markets = response.json()
-    relevant = [
-        m for m in markets
-        if all(term.lower() in m.get("question", "").lower() for term in query_terms)
-    ]
-    return relevant
+
+def get_best_trading_markets(count: int = 3) -> list:
+    """Get the best markets for trading from target categories.
+    
+    Focuses on crypto, politics, and economics markets as these
+    typically have the best volume and predictability.
+    
+    Args:
+        count: Number of markets to return (default: 3).
+    
+    Returns:
+        List of top mispriced markets from target categories with deviation info.
+    """
+    target_categories = ["crypto", "politics", "economics"]
+    
+    markets = find_relevant_markets(
+        count=count,
+        min_deviation_pct=12.0,
+        categories=target_categories,
+    )
+    
+    return markets
 
 
 def place_trade(
@@ -2887,24 +2999,36 @@ def bot_loop(send_notification):
                     wait_with_check(bot_config.get("cycle_interval_seconds", 300))
                     continue
 
-            # Find markets
-            markets = find_relevant_markets()
+            # Find top 3 mispriced markets from crypto, politics, economics
+            markets = get_best_trading_markets(count=3)
 
             if not markets:
-                logger.info("No relevant markets found")
+                logger.info("No mispriced markets found (crypto/politics/economics)")
                 wait_with_check(bot_config.get("cycle_interval_seconds", 300))
                 continue
 
-            # Execute trades with confidence
+            # Execute trades with confidence + deviation_pct as extra confidence
             for market in markets:
+                # Get price deviation info
+                deviation_info = market.get("price_deviation", {})
+                deviation_pct = abs(deviation_info.get("deviation_pct", 0))
+                deviation_direction = deviation_info.get("direction", "unknown")
+                category = market.get("category", "other")
+                
+                # Calculate total confidence with deviation bonus
+                total_confidence = calculate_total_confidence(confidence, deviation_pct)
+                
                 if bot_config.get("dry_run", True):
                     outcome = "YES" if prediction == "up" else "NO"
                     logger.info(f"[Dry run] Would buy {outcome} on {market.get('question')}")
                     send_notification(
                         f"📊 **Dry Run Trade**\n"
-                        f"Market: {market.get('question', 'N/A')[:50]}...\n"
+                        f"Market: {truncate_question(market.get('question', 'N/A'))}...\n"
+                        f"Category: {category.capitalize()}\n"
                         f"Prediction: {prediction.upper()}\n"
-                        f"Confidence: {confidence:.1f}%\n"
+                        f"Base Confidence: {confidence:.1f}%\n"
+                        f"📈 Deviation: {deviation_pct:.1f}% ({deviation_direction})\n"
+                        f"🎯 Total Confidence: {total_confidence:.1f}%\n"
                         f"Would buy: {outcome}\n\n"
                         f"📊 **Signals:**\n"
                         f"• MA: {signals.get('ma_crossover', {}).get('direction', 'N/A').upper()} "
@@ -2928,16 +3052,19 @@ def bot_loop(send_notification):
                     if result.get("success"):
                         send_notification(
                             f"✅ **Trade Executed**\n"
-                            f"Market: {market.get('question', 'N/A')[:50]}...\n"
+                            f"Market: {truncate_question(market.get('question', 'N/A'))}\n"
+                            f"Category: {category.capitalize()}\n"
                             f"Side: {outcome.upper()}\n"
-                            f"Confidence: {confidence:.1f}%\n"
+                            f"Base Confidence: {confidence:.1f}%\n"
+                            f"📈 Deviation: {deviation_pct:.1f}% ({deviation_direction})\n"
+                            f"🎯 Total Confidence: {total_confidence:.1f}%\n"
                             f"Amount: ${trade_amount}\n"
                             f"Price: {result.get('price', 'N/A')}"
                         )
                     else:
                         send_notification(
                             f"❌ **Trade Failed**\n"
-                            f"Market: {market.get('question', 'N/A')[:50]}...\n"
+                            f"Market: {truncate_question(market.get('question', 'N/A'))}\n"
                             f"Error: {result.get('error', 'Unknown')}"
                         )
 
@@ -2979,6 +3106,10 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         [
             InlineKeyboardButton("🔮 Predict", callback_data="predict"),
             InlineKeyboardButton("📈 Markets", callback_data="markets"),
+        ],
+        [
+            InlineKeyboardButton("🔎 Scan", callback_data="scan"),
+            InlineKeyboardButton("💹 Trade", callback_data="trade"),
         ],
         [
             InlineKeyboardButton("▶️ Start Bot", callback_data="start_bot"),
@@ -3049,9 +3180,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 **Trading:**
 /balance - Alle Balances anzeigen
 /predict - Multi-Signal Vorhersage anzeigen 📈
-/markets - Relevante Märkte finden
-/scan - Alle Märkte scannen 🔎 (Top 5 Mispriced)
-/trade - Manueller Trade
+/markets - Top 8 Mispriced Märkte (≥12% Abweichung) 📈
+/scan - Alle Märkte scannen 🔎 (Top 8 Mispriced, ≥12%)
+/trade - Manueller Trade (Top 3 Crypto/Politics/Economics)
 /bridge - Solana→Polygon Bridge
 
 **Position Tracking:**
@@ -3285,33 +3416,56 @@ Status: {trade_status}
 
 
 async def markets_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /markets command."""
+    """Handle /markets command - Show top mispriced markets."""
     if not is_authorized(update):
         await unauthorized_response(update)
         return
 
-    await update.message.reply_text("🔍 Searching for markets...")
+    await update.message.reply_text("🔍 Searching for top mispriced markets...")
 
-    markets = find_relevant_markets()
+    try:
+        # Get top 8 mispriced markets with >= 12% deviation
+        markets = get_top_mispriced_markets(count=8, min_deviation_pct=12.0)
 
-    if not markets:
-        await update.message.reply_text("No relevant markets found for today.")
-        return
+        if not markets:
+            await update.message.reply_text(
+                "📊 No significantly mispriced markets found.\n"
+                "Try /scan for a full market overview."
+            )
+            return
 
-    text = f"📈 **Found {len(markets)} Market(s)**\n\n"
-    for i, market in enumerate(markets[:5], 1):
-        text += f"{i}. {market.get('question', 'N/A')[:80]}\n"
-        text += f"   ID: `{market.get('id', 'N/A')[:20]}...`\n\n"
+        text = f"📈 **Top {len(markets)} Mispriced Markets**\n\n"
+        for i, market in enumerate(markets[:8], 1):
+            question = truncate_question(market.get("question", "N/A"))
+            category = market.get("category", "other")
+            deviation = market.get("price_deviation", {})
+            dev_pct = abs(deviation.get("deviation_pct", 0))
+            direction = deviation.get("direction", "unknown")
+            current_price = deviation.get("current_price", 0)
+            
+            emoji = "📉" if direction == "underpriced" else "📈"
+            text += f"**{i}. {question}**\n"
+            text += f"   {emoji} {direction.upper()}: {dev_pct:.1f}%\n"
+            text += f"   📊 Price: {current_price:.2%} | 🏷️ {category.capitalize()}\n\n"
 
-    await update.message.reply_text(text, parse_mode="Markdown")
+        text += "_Use /scan for detailed analysis_"
+
+        await update.message.reply_text(text, parse_mode="Markdown")
+        
+    except Exception as e:
+        logger.error(f"Error in markets_command: {e}")
+        await update.message.reply_text(
+            f"❌ Error fetching markets: {str(e)[:100]}",
+            parse_mode="Markdown",
+        )
 
 
 async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /scan command - Scan ALL active markets for mispriced opportunities.
 
     This command fetches all active Polymarket markets with volume > $10k,
-    categorizes them, and identifies the top 5 markets where current price
-    deviates significantly from historical mean.
+    categorizes them, and identifies the top 8 markets where current price
+    deviates significantly (>= 12%) from historical mean.
     """
     if not is_authorized(update):
         await unauthorized_response(update)
@@ -3324,23 +3478,13 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         all_markets = scan_all_markets()
         summary = get_category_summary(all_markets)
 
-        # Filter for mispriced markets (>= 5% deviation)
-        mispriced = [
-            m for m in all_markets
-            if abs(m.get("price_deviation", {}).get("deviation_pct", 0)) >= 5.0
-            and m.get("price_deviation", {}).get("current_price") is not None
-        ]
-        # Sort by absolute deviation and take top 5
-        mispriced.sort(
-            key=lambda m: abs(m.get("price_deviation", {}).get("deviation_pct", 0)),
-            reverse=True,
-        )
-        mispriced = mispriced[:5]
+        # Get top 8 mispriced markets with >= 12% deviation
+        mispriced = get_top_mispriced_markets(count=8, min_deviation_pct=12.0)
 
         if not mispriced:
             # If no mispriced markets found, show category summary
             text = "📊 **Market Scan Complete**\n\n"
-            text += "No significantly mispriced markets found.\n\n"
+            text += "No significantly mispriced markets found (>= 12% deviation).\n\n"
             text += "**Markets by Category:**\n"
             for cat, count in sorted(summary.items(), key=lambda x: -x[1]):
                 text += f"• {cat.capitalize()}: {count}\n"
@@ -4485,7 +4629,7 @@ async def bridge_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def trade_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /trade command for manual trading."""
+    """Handle /trade command for manual trading with mispriced markets."""
     if not is_authorized(update):
         await unauthorized_response(update)
         return
@@ -4497,17 +4641,32 @@ async def trade_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
         return
 
-    # Find markets first
-    markets = find_relevant_markets()
+    # Find top 3 mispriced markets from crypto, politics, economics
+    markets = get_best_trading_markets(count=3)
 
     if not markets:
-        await update.message.reply_text("No relevant markets found for today.")
+        await update.message.reply_text(
+            "📊 No mispriced markets found (crypto/politics/economics).\n"
+            "Try /scan for a full market overview."
+        )
         return
 
     # Get current prediction
     pred = get_current_prediction()
     prediction = pred.get("prediction", "hold")
+    confidence = pred.get("confidence", 0)
     outcome = "YES" if prediction == "up" else "NO"
+    
+    # Get deviation info for the best market
+    best_market = markets[0]
+    deviation_info = best_market.get("price_deviation", {})
+    deviation_pct = abs(deviation_info.get("deviation_pct", 0))
+    deviation_direction = deviation_info.get("direction", "unknown")
+    category = best_market.get("category", "other")
+    current_price = deviation_info.get("current_price", 0)
+    
+    # Calculate total confidence with deviation bonus
+    total_confidence = calculate_total_confidence(confidence, deviation_pct)
 
     keyboard = [
         [
@@ -4518,12 +4677,20 @@ async def trade_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    context.user_data["trade_market"] = markets[0]
+    context.user_data["trade_market"] = best_market
 
     await update.message.reply_text(
-        f"📈 **Manual Trade**\n\n"
-        f"Market: {markets[0].get('question', 'N/A')[:80]}\n"
-        f"Prediction suggests: {outcome}\n"
+        f"📈 **Manual Trade (Top Mispriced Market)**\n\n"
+        f"Market: {truncate_question(best_market.get('question', 'N/A'), 70)}\n"
+        f"Category: {category.capitalize()}\n"
+        f"📊 Price: {current_price:.2%}\n\n"
+        f"**Deviation Analysis:**\n"
+        f"{'📉' if deviation_direction == 'underpriced' else '📈'} "
+        f"{deviation_direction.upper()}: {deviation_pct:.1f}%\n\n"
+        f"**Trade Signals:**\n"
+        f"Prediction: {prediction.upper()} ({outcome})\n"
+        f"Base Confidence: {confidence:.1f}%\n"
+        f"🎯 Total Confidence: {total_confidence:.1f}%\n"
         f"Amount: ${bot_config.get('trade_amount', 5.0)}\n\n"
         f"Select your trade:",
         reply_markup=reply_markup,
@@ -4758,15 +4925,113 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
     elif data == "markets":
-        await query.edit_message_text("🔍 Searching markets...")
-        markets = find_relevant_markets()
+        await query.edit_message_text("🔍 Searching for mispriced markets...")
+        
+        try:
+            # Get top 5 mispriced markets with >= 12% deviation
+            markets = get_top_mispriced_markets(count=5, min_deviation_pct=12.0)
 
-        if not markets:
-            text = "No relevant markets found."
-        else:
-            text = f"📈 **{len(markets)} Market(s)**\n\n"
-            for i, m in enumerate(markets[:3], 1):
-                text += f"{i}. {m.get('question', 'N/A')[:60]}...\n"
+            if not markets:
+                text = "📊 No mispriced markets found (>= 12% deviation).\nTry /scan for details."
+            else:
+                text = f"📈 **Top {len(markets)} Mispriced Markets**\n\n"
+                for i, m in enumerate(markets[:5], 1):
+                    question = m.get("question", "N/A")[:50]
+                    category = m.get("category", "other")
+                    deviation = m.get("price_deviation", {})
+                    dev_pct = abs(deviation.get("deviation_pct", 0))
+                    direction = deviation.get("direction", "unknown")
+                    emoji = "📉" if direction == "underpriced" else "📈"
+                    text += f"{i}. {question}...\n"
+                    text += f"   {emoji} {dev_pct:.1f}% | 🏷️ {category.capitalize()}\n"
+                    
+        except Exception as e:
+            text = f"❌ Error: {str(e)[:50]}"
+
+        keyboard = [[InlineKeyboardButton("« Back", callback_data="back_main")]]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+    elif data == "scan":
+        await query.edit_message_text("🔍 Scanning all active markets... This may take a moment.")
+        
+        try:
+            # Scan all markets once
+            all_markets = scan_all_markets()
+            summary = get_category_summary(all_markets)
+            
+            # Get top 8 mispriced markets with >= 12% deviation
+            mispriced = get_top_mispriced_markets(count=8, min_deviation_pct=12.0)
+
+            if not mispriced:
+                text = "📊 **Scan Complete**\n\n"
+                text += "No mispriced markets found (>= 12%).\n\n"
+                text += "**Markets by Category:**\n"
+                for cat, count in sorted(summary.items(), key=lambda x: -x[1]):
+                    text += f"• {cat.capitalize()}: {count}\n"
+            else:
+                text = format_scan_results(mispriced)
+                text += f"\n**Total:** {len(all_markets)} markets"
+                
+        except Exception as e:
+            text = f"❌ Error scanning: {str(e)[:50]}"
+
+        keyboard = [[InlineKeyboardButton("« Back", callback_data="back_main")]]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+    elif data == "trade":
+        # Check dry run mode
+        if bot_config.get("dry_run", True):
+            text = "⚠️ **Dry Run Mode**\n\nLive trading disabled.\nUse /toggle_dry_run first."
+            keyboard = [[InlineKeyboardButton("« Back", callback_data="back_main")]]
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+            return
+
+        await query.edit_message_text("🔍 Finding best trading opportunities...")
+        
+        try:
+            # Get top 3 mispriced markets
+            markets = get_best_trading_markets(count=3)
+            
+            if not markets:
+                text = "📊 No mispriced markets found.\nTry /scan for details."
+            else:
+                best = markets[0]
+                deviation = best.get("price_deviation", {})
+                dev_pct = abs(deviation.get("deviation_pct", 0))
+                direction = deviation.get("direction", "unknown")
+                category = best.get("category", "other")
+                price = deviation.get("current_price", 0)
+                
+                # Get prediction
+                pred = get_current_prediction()
+                prediction = pred.get("prediction", "hold")
+                confidence = pred.get("confidence", 0)
+                outcome = "YES" if prediction == "up" else "NO"
+                
+                text = f"📈 **Trade: Best Mispriced Market**\n\n"
+                text += f"{best.get('question', 'N/A')[:60]}...\n\n"
+                text += f"Category: {category.capitalize()}\n"
+                text += f"Price: {price:.2%}\n"
+                text += f"{'📉' if direction == 'underpriced' else '📈'} {direction.upper()}: {dev_pct:.1f}%\n\n"
+                text += f"Prediction: {prediction.upper()} ({outcome})\n"
+                text += f"Confidence: {confidence:.1f}%\n"
+                text += f"Amount: ${bot_config.get('trade_amount', 5.0)}"
+                
+                # Store for potential trade
+                context.user_data["trade_market"] = best
+                
+                keyboard = [
+                    [
+                        InlineKeyboardButton("Buy YES", callback_data="trade_yes"),
+                        InlineKeyboardButton("Buy NO", callback_data="trade_no"),
+                    ],
+                    [InlineKeyboardButton("Cancel", callback_data="back_main")],
+                ]
+                await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+                return
+                
+        except Exception as e:
+            text = f"❌ Error: {str(e)[:50]}"
 
         keyboard = [[InlineKeyboardButton("« Back", callback_data="back_main")]]
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
@@ -5087,6 +5352,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 InlineKeyboardButton("📈 Markets", callback_data="markets"),
             ],
             [
+                InlineKeyboardButton("🔎 Scan", callback_data="scan"),
+                InlineKeyboardButton("💹 Trade", callback_data="trade"),
+            ],
+            [
                 InlineKeyboardButton("▶️ Start Bot", callback_data="start_bot"),
                 InlineKeyboardButton("⏹️ Stop Bot", callback_data="stop_bot"),
             ],
@@ -5102,7 +5371,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 InlineKeyboardButton("📜 P&L", callback_data="pnl"),
                 InlineKeyboardButton("📊 Positions", callback_data="positions"),
             ],
-            [InlineKeyboardButton("❓ Hilfe", callback_data="help")],
+            [
+                InlineKeyboardButton("🛡️ Risk", callback_data="risk"),
+                InlineKeyboardButton("❓ Hilfe", callback_data="help"),
+            ],
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
 
