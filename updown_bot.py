@@ -277,7 +277,10 @@ def send_to_polymarket_bridge(deposit_address: str, amount_usdc: float) -> bool:
                 )
 
                 if not hasattr(token_accounts, 'value') or not token_accounts.value:
-                    raise ValueError("No USDC token account found")  # noqa: TRY301
+                    raise ValueError(  # noqa: TRY301
+                        "No USDC token account found for wallet. "
+                        "Ensure your Solana wallet has a USDC token account initialized."
+                    )
 
                 source_token_account = Pubkey.from_string(
                     str(token_accounts.value[0].pubkey)
@@ -343,9 +346,11 @@ def send_to_polymarket_bridge(deposit_address: str, amount_usdc: float) -> bool:
         # Fallback to SOL transfer
         if sol_balance > 0.01:  # Keep some SOL for fees
             print("📤 Transferring SOL (fallback)...")
+            print("⚠️  Note: SOL fallback uses a fixed 0.1 SOL amount (~$15-20 USD estimate).")
+            print("   For precise amounts, ensure sufficient USDC balance on Solana.")
             try:
-                # Estimate SOL amount equivalent to USDC (rough estimate: 1 SOL ≈ $20-200)
-                # This is a fallback - actual price should be fetched
+                # Use a conservative fixed SOL amount for fallback
+                # This is intentionally conservative - users should fund with USDC for precise amounts
                 sol_amount_lamports = int(0.1 * 1e9)  # Transfer 0.1 SOL as fallback
 
                 recent_blockhash = client.get_latest_blockhash().value.blockhash
@@ -453,7 +458,7 @@ def check_and_fund_polygon(clob, dry_run: bool = False) -> None:
 
     if success:
         print("\n" + "=" * 60)
-        print("✅ Solana funded → Polygon USDC.e ready")
+        print("✅ Solana funded → Polygon USDC ready")
         print("=" * 60)
         print("⏳ Note: Bridge transfers may take a few minutes to complete.")
         print("   The bot will continue with the current balance.\n")
@@ -482,26 +487,27 @@ def fetch_5min_data(crypto_id: str = "bitcoin", vs_currency: str = "usd") -> lis
 
 def predict_up_down(
     closes: list,
-    short_window: int | None = None,
-    long_window: int | None = None,
+    short_window: int = 0,
+    long_window: int = 0,
 ) -> str:
     """Predict the next price direction using a moving-average crossover.
 
     Args:
         closes: Ordered list of closing prices (oldest first).
         short_window: Look-back period for the fast moving average.
-                      Defaults to SHORT_WINDOW env var or 5.
+                      Defaults to SHORT_WINDOW env var or 5. Pass 0 to use default.
         long_window: Look-back period for the slow moving average.
-                     Defaults to LONG_WINDOW env var or 20.
+                     Defaults to LONG_WINDOW env var or 20. Pass 0 to use default.
 
     Returns:
         'up'   – short MA is above long MA (bullish signal)
         'down' – short MA is at or below long MA (bearish signal)
         'hold' – not enough data to compute the long MA
     """
-    if short_window is None:
+    # Use module-level defaults if 0 is passed (sentinel value for "use default")
+    if short_window <= 0:
         short_window = SHORT_WINDOW
-    if long_window is None:
+    if long_window <= 0:
         long_window = LONG_WINDOW
 
     if len(closes) < long_window:
