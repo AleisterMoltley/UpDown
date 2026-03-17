@@ -1973,6 +1973,11 @@ KELLY_MAX_FRACTION = 0.15  # Maximum 15% of balance per trade
 KELLY_MIN_TRADE_USD = 3.0  # Minimum $3 per trade
 KELLY_HOUSE_EDGE_BUFFER = 0.03  # Polymarket house edge buffer
 
+# Backtest-based Kelly constants (from actual trading results)
+KELLY_AVG_WIN_PCT = 0.07  # 7% average win from backtest
+KELLY_AVG_LOSS_PCT = 0.04  # 4% average loss from backtest
+KELLY_MAX_FRACTION_BACKTEST = 0.25  # Maximum 25% Kelly fraction
+
 
 def kelly_position_size(confidence: float, balance: float, deviation_pct: float = 0.0) -> float:
     """Calculate optimal position size using Kelly Criterion.
@@ -2020,6 +2025,68 @@ def kelly_position_size(confidence: float, balance: float, deviation_pct: float 
     position_size = max(KELLY_MIN_TRADE_USD, min(position_size, max_position))
     
     return round(position_size, 2)
+
+
+def calc_kelly_size(
+    confidence: float,
+    balance: float,
+    base_trade_amount: float = 5.0,
+) -> dict:
+    """Calculate Kelly-optimized position size using backtest-derived edge.
+    
+    Uses the Kelly Criterion with actual backtest results:
+    - edge = (confidence/100 * 0.07) - ((1 - confidence/100) * 0.04)
+    - kelly_fraction = edge / 0.07 (capped at 0.25)
+    - final_size = min(balance * kelly_fraction, base_trade_amount * 3)
+    
+    This formula is derived from actual backtest results:
+    - 7% average win percentage
+    - 4% average loss percentage
+    
+    Args:
+        confidence: Confidence level (0-100) from multi-signal engine.
+        balance: Current USDC balance.
+        base_trade_amount: Base trade amount from config (default $5).
+    
+    Returns:
+        Dictionary with:
+            - size: Final bet size in USD
+            - edge: Calculated edge percentage
+            - kelly_fraction: Kelly fraction (before capping)
+    """
+    # Calculate edge using backtest-derived average win/loss percentages
+    # edge = (win_prob * avg_win) - (loss_prob * avg_loss)
+    win_prob = confidence / 100.0
+    loss_prob = 1.0 - win_prob
+    
+    edge = (win_prob * KELLY_AVG_WIN_PCT) - (loss_prob * KELLY_AVG_LOSS_PCT)
+    edge_pct = edge * 100  # Convert to percentage for logging
+    
+    # Kelly fraction = edge / avg_win (capped at max 25%)
+    if edge <= 0:
+        # Negative edge means losing bet, use minimum size
+        kelly_fraction = 0.0
+        final_size = KELLY_MIN_TRADE_USD
+    else:
+        kelly_fraction = edge / KELLY_AVG_WIN_PCT
+        kelly_fraction = min(kelly_fraction, KELLY_MAX_FRACTION_BACKTEST)
+        
+        # Final bet size: min(balance * kelly_fraction, base_trade_amount * 3)
+        kelly_size = balance * kelly_fraction
+        max_size = base_trade_amount * 3.0
+        final_size = min(kelly_size, max_size)
+        
+        # Ensure minimum trade size
+        final_size = max(KELLY_MIN_TRADE_USD, final_size)
+    
+    # Log Kelly bet size calculation
+    logger.info(f"Kelly bet size: ${final_size:.2f} (edge {edge_pct:.2f}%)")
+    
+    return {
+        "size": round(final_size, 2),
+        "edge": round(edge_pct, 2),
+        "kelly_fraction": round(kelly_fraction, 4),
+    }
 
 
 def sigmoid(x: float) -> float:
@@ -3952,13 +4019,16 @@ def bot_loop(send_notification):
 
                 if bot_config.get("dry_run", True):
                     outcome = "YES" if prediction == "up" else "NO"
-                    # Calculate Kelly size for dry run display (no config persistence)
+                    # Calculate Kelly size for dry run display using backtest-based formula
                     current_balance = get_polygon_balance()
-                    kelly_size = kelly_position_size(
+                    base_trade_amount = bot_config.get("trade_amount", 5.0)
+                    kelly_result = calc_kelly_size(
                         confidence=total_confidence,
                         balance=current_balance,
-                        deviation_pct=deviation_pct,
+                        base_trade_amount=base_trade_amount,
                     )
+                    kelly_size = kelly_result["size"]
+                    kelly_edge = kelly_result["edge"]
                     
                     logger.info(f"[Dry run] Would buy {outcome} on {market.get('question')}")
                     send_notification(
@@ -3970,7 +4040,8 @@ def bot_loop(send_notification):
                         f"📈 Deviation: {deviation_pct:.1f}% ({direction})\n"
                         f"🎯 Total Confidence: {total_confidence:.1f}%\n"
                         f"Would buy: {outcome}\n"
-                        f"💰 Kelly Size: ${kelly_size:.2f} (Balance: ${current_balance:.2f})\n\n"
+                        f"💰 Kelly Size: ${kelly_size:.2f} (edge {kelly_edge:.2f}%)\n"
+                        f"Balance: ${current_balance:.2f}\n\n"
                         f"📊 **Market Data:**\n"
                         f"• Current Price: {current_price:.2%}\n"
                         f"• Historical Mean: {historical_mean:.2%}\n\n"
@@ -3987,15 +4058,16 @@ def bot_loop(send_notification):
                 else:
                     outcome = "yes" if prediction == "up" else "no"
                     
-                    # Calculate Kelly-optimized position size
+                    # Calculate Kelly-optimized position size using backtest-based formula
                     current_balance = get_polygon_balance()
-                    kelly_size = kelly_position_size(
+                    base_trade_amount = bot_config.get("trade_amount", 5.0)
+                    kelly_result = calc_kelly_size(
                         confidence=total_confidence,
                         balance=current_balance,
-                        deviation_pct=deviation_pct,
+                        base_trade_amount=base_trade_amount,
                     )
-                    # Store Kelly-calculated size in config (overrides fixed value)
-                    bot_config["trade_amount"] = kelly_size
+                    kelly_size = kelly_result["size"]
+                    kelly_edge = kelly_result["edge"]
                     
                     result = place_trade(
                         market,
@@ -4013,7 +4085,8 @@ def bot_loop(send_notification):
                             f"Base Confidence: {confidence:.1f}%\n"
                             f"📈 Deviation: {deviation_pct:.1f}% ({direction})\n"
                             f"🎯 Total Confidence: {total_confidence:.1f}%\n"
-                            f"💰 Kelly Size: ${kelly_size:.2f} (Balance: ${current_balance:.2f})\n"
+                            f"💰 Kelly Size: ${kelly_size:.2f} (edge {kelly_edge:.2f}%)\n"
+                            f"Balance: ${current_balance:.2f}\n"
                             f"Price: {result.get('price', 'N/A')}"
                             f"{logreg_text}"
                         )
@@ -5960,13 +6033,16 @@ async def trade_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     deviation_bonus = min(15.0, deviation_pct / 2.0)
     total_confidence = min(100.0, base_confidence + deviation_bonus)
 
-    # Calculate Kelly-optimized position size
+    # Calculate Kelly-optimized position size using backtest-based formula
     current_balance = get_polygon_balance()
-    kelly_size = kelly_position_size(
+    base_trade_amount = bot_config.get("trade_amount", 5.0)
+    kelly_result = calc_kelly_size(
         confidence=total_confidence,
         balance=current_balance,
-        deviation_pct=deviation_pct,
+        base_trade_amount=base_trade_amount,
     )
+    kelly_size = kelly_result["size"]
+    kelly_edge = kelly_result["edge"]
     # Store Kelly size in user_data for use when trade is confirmed (not in global config)
     context.user_data["kelly_trade_amount"] = kelly_size
 
@@ -5997,7 +6073,8 @@ async def trade_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"• 🎯 Total: {total_confidence:.1f}%\n\n"
         f"**Trade:**\n"
         f"• Prediction suggests: {outcome}\n"
-        f"• 💰 Kelly Size: ${kelly_size:.2f} (Balance: ${current_balance:.2f})\n\n"
+        f"• 💰 Kelly Size: ${kelly_size:.2f} (edge {kelly_edge:.2f}%)\n"
+        f"• Balance: ${current_balance:.2f}\n\n"
         f"Select your trade:",
         reply_markup=reply_markup,
         parse_mode="Markdown",

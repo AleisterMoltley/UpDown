@@ -64,6 +64,12 @@ SOLANA_USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 # Bridge endpoint
 POLYMARKET_BRIDGE_URL = "https://bridge.polymarket.com/deposit"
 
+# Kelly Criterion constants (backtest-derived)
+KELLY_AVG_WIN_PCT = 0.07  # 7% average win from backtest
+KELLY_AVG_LOSS_PCT = 0.04  # 4% average loss from backtest
+KELLY_MAX_FRACTION = 0.25  # Maximum 25% Kelly fraction
+KELLY_MIN_TRADE_USD = 3.0  # Minimum $3 per trade
+
 # ---------------------------------------------------------------------------
 # Clients
 # ---------------------------------------------------------------------------
@@ -599,6 +605,31 @@ def check_and_fund_polygon(clob, dry_run: bool = False) -> None:
 # Data fetching
 # ---------------------------------------------------------------------------
 
+
+def get_polygon_balance(clob) -> float:
+    """Get current Polygon USDC balance from CLOB client.
+    
+    Args:
+        clob: The ClobClient instance (may be None).
+    
+    Returns:
+        Current USDC balance, or 100.0 as default if unavailable.
+    """
+    if clob is None:
+        return 100.0  # Default balance for dry run
+    
+    try:
+        balance_info = clob.get_balance()
+        if isinstance(balance_info, dict):
+            return float(balance_info.get("balance", 0) or 0)
+        return float(balance_info or 0)
+    except Exception as exc:  # noqa: BLE001
+        if _is_auth_error(exc):
+            invalidate_l2_credentials_cache()
+        print(f"Warning: Could not fetch Polygon balance: {exc}")
+        return 100.0  # Default fallback
+
+
 def fetch_5min_data(
     crypto_id: str = "bitcoin",
     vs_currency: str = "usd",
@@ -668,7 +699,7 @@ def predict_up_down(
     closes: list,
     short_window: int = 0,
     long_window: int = 0,
-) -> str:
+) -> dict:
     """Predict the next price direction using a moving-average crossover.
 
     Args:
@@ -679,9 +710,9 @@ def predict_up_down(
                      Defaults to LONG_WINDOW env var or 20. Pass 0 to use default.
 
     Returns:
-        'up'   – short MA is above long MA (bullish signal)
-        'down' – short MA is at or below long MA (bearish signal)
-        'hold' – not enough data to compute the long MA
+        Dictionary with:
+            - direction: 'up', 'down', or 'hold'
+            - confidence: Confidence score (50-100) based on MA crossover strength
     """
     # Use module-level defaults if 0 is passed (sentinel value for "use default")
     if short_window <= 0:
@@ -690,12 +721,23 @@ def predict_up_down(
         long_window = LONG_WINDOW
 
     if len(closes) < long_window:
-        return "hold"
+        return {"direction": "hold", "confidence": 0}
 
     ma_short = sum(closes[-short_window:]) / short_window
     ma_long = sum(closes[-long_window:]) / long_window
-
-    return "up" if ma_short > ma_long else "down"
+    
+    direction = "up" if ma_short > ma_long else "down"
+    
+    # Calculate confidence based on MA crossover strength
+    # Strength = percentage difference between short and long MA
+    if ma_long > 0:
+        crossover_strength = abs(ma_short - ma_long) / ma_long * 100
+        # Scale to confidence: 0% diff = 50% conf, 2%+ diff = 100% conf
+        confidence = min(100.0, 50.0 + crossover_strength * 25.0)
+    else:
+        confidence = 50.0
+    
+    return {"direction": direction, "confidence": round(confidence, 1)}
 
 
 # ---------------------------------------------------------------------------
@@ -740,6 +782,69 @@ def find_relevant_markets(query_terms: list | None = None) -> list:
 # ---------------------------------------------------------------------------
 # Trade execution
 # ---------------------------------------------------------------------------
+
+
+def calc_kelly_size(
+    confidence: float,
+    balance: float,
+    base_trade_amount: float = 5.0,
+) -> dict:
+    """Calculate Kelly-optimized position size using backtest-derived edge.
+    
+    Uses the Kelly Criterion with actual backtest results:
+    - edge = (confidence/100 * 0.07) - ((1 - confidence/100) * 0.04)
+    - kelly_fraction = edge / 0.07 (capped at 0.25)
+    - final_size = min(balance * kelly_fraction, base_trade_amount * 3)
+    
+    This formula is derived from actual backtest results:
+    - 7% average win percentage
+    - 4% average loss percentage
+    
+    Args:
+        confidence: Confidence level (0-100) from multi-signal engine.
+        balance: Current USDC balance.
+        base_trade_amount: Base trade amount from config (default $5).
+    
+    Returns:
+        Dictionary with:
+            - size: Final bet size in USD
+            - edge: Calculated edge percentage
+            - kelly_fraction: Kelly fraction (before capping)
+    """
+    # Calculate edge using backtest-derived average win/loss percentages
+    # edge = (win_prob * avg_win) - (loss_prob * avg_loss)
+    win_prob = confidence / 100.0
+    loss_prob = 1.0 - win_prob
+    
+    edge = (win_prob * KELLY_AVG_WIN_PCT) - (loss_prob * KELLY_AVG_LOSS_PCT)
+    edge_pct = edge * 100  # Convert to percentage for logging
+    
+    # Kelly fraction = edge / avg_win (capped at max 25%)
+    if edge <= 0:
+        # Negative edge means losing bet, use minimum size
+        kelly_fraction = 0.0
+        final_size = KELLY_MIN_TRADE_USD
+    else:
+        kelly_fraction = edge / KELLY_AVG_WIN_PCT
+        kelly_fraction = min(kelly_fraction, KELLY_MAX_FRACTION)
+        
+        # Final bet size: min(balance * kelly_fraction, base_trade_amount * 3)
+        kelly_size = balance * kelly_fraction
+        max_size = base_trade_amount * 3.0
+        final_size = min(kelly_size, max_size)
+        
+        # Ensure minimum trade size
+        final_size = max(KELLY_MIN_TRADE_USD, final_size)
+    
+    # Log Kelly bet size calculation
+    print(f"Kelly bet size: ${final_size:.2f} (edge {edge_pct:.2f}%)")
+    
+    return {
+        "size": round(final_size, 2),
+        "edge": round(edge_pct, 2),
+        "kelly_fraction": round(kelly_fraction, 4),
+    }
+
 
 def place_trade(
     clob,
@@ -855,9 +960,11 @@ def run_bot(
         closes = [candle[4] for candle in ohlc]
         print(f"Fetched {len(closes)} candles. Latest close: {closes[-1] if closes else 'n/a'}")
 
-        # Step 2 – Predict direction.
-        prediction = predict_up_down(closes)
-        print(f"Prediction for next period: {prediction.upper()}")
+        # Step 2 – Predict direction with confidence.
+        prediction_result = predict_up_down(closes)
+        prediction = prediction_result["direction"]
+        confidence = prediction_result["confidence"]
+        print(f"Prediction for next period: {prediction.upper()} (confidence: {confidence:.1f}%)")
 
         if prediction == "hold":
             print("Not enough data – skipping trade.")
@@ -873,15 +980,24 @@ def run_bot(
             for market in markets:
                 print(f"  Market: {market.get('question')} (ID: {market.get('id')})")
 
-                # Step 4 – Execute trade.
+                # Step 4 – Calculate Kelly-optimized position size and execute trade.
+                current_balance = get_polygon_balance(clob)
+                kelly_result = calc_kelly_size(
+                    confidence=confidence,
+                    balance=current_balance,
+                    base_trade_amount=trade_amount,
+                )
+                kelly_size = kelly_result["size"]
+                kelly_edge = kelly_result["edge"]
+                
                 if dry_run:
                     print(
                         f"  [Dry run] Would buy {'YES' if prediction == 'up' else 'NO'} "
-                        f"for ${trade_amount} USDC."
+                        f"for ${kelly_size:.2f} USDC. Kelly bet size: ${kelly_size:.2f} (edge {kelly_edge:.2f}%)"
                     )
                 else:
                     outcome = "yes" if prediction == "up" else "no"
-                    place_trade(clob, market, outcome=outcome, amount=trade_amount)
+                    place_trade(clob, market, outcome=outcome, amount=kelly_size)
 
         print(f"Sleeping {CYCLE_INTERVAL}s until next cycle…\n")
         time.sleep(CYCLE_INTERVAL)

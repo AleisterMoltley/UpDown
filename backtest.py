@@ -37,6 +37,12 @@ TRADE_HOLDING_PERIOD_CANDLES = 12
 # Using sqrt(8760) ≈ 93.6 for hourly annualization
 SHARPE_ANNUALIZATION_FACTOR = 93.6
 
+# Kelly Criterion constants (backtest-derived)
+KELLY_AVG_WIN_PCT = 0.07  # 7% average win from backtest
+KELLY_AVG_LOSS_PCT = 0.04  # 4% average loss from backtest
+KELLY_MAX_FRACTION = 0.25  # Maximum 25% Kelly fraction
+KELLY_MIN_TRADE_USD = 3.0  # Minimum $3 per trade
+
 # File path for storing backtest results (same as PNL file for integration)
 BACKTEST_RESULTS_FILE = Path("daily_pnl.json")
 
@@ -361,6 +367,68 @@ def calculate_confidence_backtest(closes: list, config: dict | None = None) -> d
             "macd": macd_signal,
             "momentum": momentum_signal,
         },
+    }
+
+
+def calc_kelly_size(
+    confidence: float,
+    balance: float,
+    base_trade_amount: float = 5.0,
+) -> dict:
+    """Calculate Kelly-optimized position size using backtest-derived edge.
+    
+    Uses the Kelly Criterion with actual backtest results:
+    - edge = (confidence/100 * 0.07) - ((1 - confidence/100) * 0.04)
+    - kelly_fraction = edge / 0.07 (capped at 0.25)
+    - final_size = min(balance * kelly_fraction, base_trade_amount * 3)
+    
+    This formula is derived from actual backtest results:
+    - 7% average win percentage
+    - 4% average loss percentage
+    
+    Args:
+        confidence: Confidence level (0-100) from multi-signal engine.
+        balance: Current USDC balance.
+        base_trade_amount: Base trade amount from config (default $5).
+    
+    Returns:
+        Dictionary with:
+            - size: Final bet size in USD
+            - edge: Calculated edge percentage
+            - kelly_fraction: Kelly fraction (before capping)
+    """
+    # Calculate edge using backtest-derived average win/loss percentages
+    # edge = (win_prob * avg_win) - (loss_prob * avg_loss)
+    win_prob = confidence / 100.0
+    loss_prob = 1.0 - win_prob
+    
+    edge = (win_prob * KELLY_AVG_WIN_PCT) - (loss_prob * KELLY_AVG_LOSS_PCT)
+    edge_pct = edge * 100  # Convert to percentage for logging
+    
+    # Kelly fraction = edge / avg_win (capped at max 25%)
+    if edge <= 0:
+        # Negative edge means losing bet, use minimum size
+        kelly_fraction = 0.0
+        final_size = KELLY_MIN_TRADE_USD
+    else:
+        kelly_fraction = edge / KELLY_AVG_WIN_PCT
+        kelly_fraction = min(kelly_fraction, KELLY_MAX_FRACTION)
+        
+        # Final bet size: min(balance * kelly_fraction, base_trade_amount * 3)
+        kelly_size = balance * kelly_fraction
+        max_size = base_trade_amount * 3.0
+        final_size = min(kelly_size, max_size)
+        
+        # Ensure minimum trade size
+        final_size = max(KELLY_MIN_TRADE_USD, final_size)
+    
+    # Log Kelly bet size calculation
+    logger.debug(f"Kelly bet size: ${final_size:.2f} (edge {edge_pct:.2f}%)")
+    
+    return {
+        "size": round(final_size, 2),
+        "edge": round(edge_pct, 2),
+        "kelly_fraction": round(kelly_fraction, 4),
     }
 
 
