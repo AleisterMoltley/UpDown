@@ -56,6 +56,62 @@ from market_scanner import (
 load_dotenv()
 
 # ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+# Text truncation lengths for consistent display
+MARKET_QUESTION_TRUNCATE_LENGTH = 60
+
+# Deviation confidence bonus multiplier (0.5 = deviation_pct adds up to 50% bonus)
+DEVIATION_CONFIDENCE_MULTIPLIER = 0.5
+
+# Maximum total confidence value
+MAX_CONFIDENCE = 100.0
+
+# ---------------------------------------------------------------------------
+# Helper Functions
+# ---------------------------------------------------------------------------
+
+
+def calculate_total_confidence(base_confidence: float, deviation_pct: float) -> float:
+    """Calculate total trading confidence including deviation bonus.
+    
+    The deviation percentage from historical mean adds extra confidence
+    to the trade decision. A higher deviation suggests a more significant
+    mispricing opportunity.
+    
+    Args:
+        base_confidence: Base confidence from multi-signal analysis (0-100).
+        deviation_pct: Absolute price deviation percentage from historical mean.
+    
+    Returns:
+        Total confidence capped at MAX_CONFIDENCE (100%).
+    
+    Example:
+        - base_confidence=70%, deviation_pct=20% → 70 + (20 * 0.5) = 80%
+        - base_confidence=80%, deviation_pct=50% → 80 + (50 * 0.5) = 105% → capped to 100%
+    """
+    bonus = abs(deviation_pct) * DEVIATION_CONFIDENCE_MULTIPLIER
+    total = base_confidence + bonus
+    return min(MAX_CONFIDENCE, total)
+
+
+def truncate_question(question: str, max_length: int = MARKET_QUESTION_TRUNCATE_LENGTH) -> str:
+    """Truncate market question text for display.
+    
+    Args:
+        question: The market question text.
+        max_length: Maximum length before truncation.
+    
+    Returns:
+        Truncated question with '...' suffix if needed.
+    """
+    if len(question) <= max_length:
+        return question
+    return question[:max_length] + "..."
+
+
+# ---------------------------------------------------------------------------
 # Logging setup
 # ---------------------------------------------------------------------------
 logging.basicConfig(
@@ -1990,9 +2046,14 @@ def find_relevant_markets(
         List of top mispriced markets sorted by absolute deviation.
     """
     try:
+        # When filtering by categories, fetch more markets to ensure we have enough
+        # after filtering. We use 4x multiplier to be safe, as typically only
+        # ~25-40% of markets match crypto/politics/economics categories.
+        fetch_count = count * 4 if categories else count
+        
         # Get top mispriced markets using the new scanner
         markets = get_top_mispriced_markets(
-            count=count * 2 if categories else count,  # Fetch more if filtering by category
+            count=fetch_count,
             min_deviation_pct=min_deviation_pct,
         )
         
@@ -2006,6 +2067,8 @@ def find_relevant_markets(
                 m for m in markets
                 if m.get("category", "other") in categories
             ]
+            if not filtered:
+                logger.info(f"No markets found in categories: {categories}")
             return filtered[:count]
         
         return markets[:count]
@@ -2952,16 +3015,15 @@ def bot_loop(send_notification):
                 deviation_direction = deviation_info.get("direction", "unknown")
                 category = market.get("category", "other")
                 
-                # Add deviation_pct as extra confidence factor
-                total_confidence = confidence + (deviation_pct * 0.5)  # Deviation adds up to 50% bonus
-                total_confidence = min(100, total_confidence)  # Cap at 100%
+                # Calculate total confidence with deviation bonus
+                total_confidence = calculate_total_confidence(confidence, deviation_pct)
                 
                 if bot_config.get("dry_run", True):
                     outcome = "YES" if prediction == "up" else "NO"
                     logger.info(f"[Dry run] Would buy {outcome} on {market.get('question')}")
                     send_notification(
                         f"📊 **Dry Run Trade**\n"
-                        f"Market: {market.get('question', 'N/A')[:50]}...\n"
+                        f"Market: {truncate_question(market.get('question', 'N/A'))}...\n"
                         f"Category: {category.capitalize()}\n"
                         f"Prediction: {prediction.upper()}\n"
                         f"Base Confidence: {confidence:.1f}%\n"
@@ -2990,7 +3052,7 @@ def bot_loop(send_notification):
                     if result.get("success"):
                         send_notification(
                             f"✅ **Trade Executed**\n"
-                            f"Market: {market.get('question', 'N/A')[:50]}...\n"
+                            f"Market: {truncate_question(market.get('question', 'N/A'))}\n"
                             f"Category: {category.capitalize()}\n"
                             f"Side: {outcome.upper()}\n"
                             f"Base Confidence: {confidence:.1f}%\n"
@@ -3002,7 +3064,7 @@ def bot_loop(send_notification):
                     else:
                         send_notification(
                             f"❌ **Trade Failed**\n"
-                            f"Market: {market.get('question', 'N/A')[:50]}...\n"
+                            f"Market: {truncate_question(market.get('question', 'N/A'))}\n"
                             f"Error: {result.get('error', 'Unknown')}"
                         )
 
@@ -3374,7 +3436,7 @@ async def markets_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         text = f"📈 **Top {len(markets)} Mispriced Markets**\n\n"
         for i, market in enumerate(markets[:8], 1):
-            question = market.get("question", "N/A")[:60]
+            question = truncate_question(market.get("question", "N/A"))
             category = market.get("category", "other")
             deviation = market.get("price_deviation", {})
             dev_pct = abs(deviation.get("deviation_pct", 0))
@@ -3382,7 +3444,7 @@ async def markets_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             current_price = deviation.get("current_price", 0)
             
             emoji = "📉" if direction == "underpriced" else "📈"
-            text += f"**{i}. {question}...**\n"
+            text += f"**{i}. {question}**\n"
             text += f"   {emoji} {direction.upper()}: {dev_pct:.1f}%\n"
             text += f"   📊 Price: {current_price:.2%} | 🏷️ {category.capitalize()}\n\n"
 
@@ -4604,8 +4666,7 @@ async def trade_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     current_price = deviation_info.get("current_price", 0)
     
     # Calculate total confidence with deviation bonus
-    total_confidence = confidence + (deviation_pct * 0.5)
-    total_confidence = min(100, total_confidence)
+    total_confidence = calculate_total_confidence(confidence, deviation_pct)
 
     keyboard = [
         [
@@ -4620,7 +4681,7 @@ async def trade_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     await update.message.reply_text(
         f"📈 **Manual Trade (Top Mispriced Market)**\n\n"
-        f"Market: {best_market.get('question', 'N/A')[:70]}...\n"
+        f"Market: {truncate_question(best_market.get('question', 'N/A'), 70)}\n"
         f"Category: {category.capitalize()}\n"
         f"📊 Price: {current_price:.2%}\n\n"
         f"**Deviation Analysis:**\n"
