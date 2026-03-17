@@ -63,7 +63,7 @@ CONFIG_FILE = Path("bot_config.json")
 PNL_FILE = Path("daily_pnl.json")
 
 # Conversation states
-# 100% Onchain-Modus: Keine API-Credentials mehr nötig, nur Private Key
+# 100% Onchain Mode: No API credentials needed, only Private Key
 (
     AWAITING_SOLANA_KEY,
     AWAITING_POLYGON_KEY,

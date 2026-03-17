@@ -798,8 +798,8 @@ def run_bot(
 
 if __name__ == "__main__":
     # Run in dry-run mode unless wallet private key is configured.
-    # 100% Onchain-Modus: Nur noch POLYMARKET_PRIVATE_KEY benötigt,
-    # L2-Credentials werden automatisch abgeleitet.
+    # 100% Onchain Mode: Only POLYMARKET_PRIVATE_KEY is required,
+    # L2 credentials are automatically derived using derive_api_key().
     _dry = not PRIVATE_KEY
     if _dry:
         print(
