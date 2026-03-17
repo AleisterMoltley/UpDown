@@ -12,7 +12,7 @@ Usage:
 
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import requests
@@ -175,6 +175,61 @@ def _get_market_volume(market: dict) -> float:
     return float(volume) if volume else 0.0
 
 
+def _get_market_volume_24h(market: dict) -> float:
+    """Extract 24-hour trading volume from market data.
+
+    Args:
+        market: Market dictionary from Gamma API.
+
+    Returns:
+        24-hour volume in USD.
+    """
+    # Try different field names for 24h volume
+    volume_24h = market.get("volume24hr", 0)
+    if not volume_24h:
+        volume_24h = market.get("volume24h", 0)
+    if not volume_24h:
+        volume_24h = market.get("volumeNum24hr", 0)
+    if not volume_24h:
+        # Fallback: sum token 24h volumes if available
+        tokens = market.get("tokens", [])
+        volume_24h = sum(float(t.get("volume24hr", 0) or t.get("volume24h", 0) or 0) for t in tokens)
+
+    return float(volume_24h) if volume_24h else 0.0
+
+
+def _get_market_end_date(market: dict) -> datetime | None:
+    """Extract market end/resolution date.
+
+    Args:
+        market: Market dictionary from Gamma API.
+
+    Returns:
+        End date as datetime or None if unavailable.
+    """
+    # Try different field names for end date
+    end_date_str = market.get("endDate") or market.get("end_date") or market.get("endDateIso")
+    if not end_date_str:
+        end_date_str = market.get("resolutionDate") or market.get("resolution_date")
+
+    if not end_date_str:
+        return None
+
+    try:
+        # Handle ISO format with or without timezone
+        if isinstance(end_date_str, str):
+            # Remove 'Z' suffix and parse
+            end_date_str = end_date_str.replace("Z", "+00:00")
+            return datetime.fromisoformat(end_date_str)
+        elif isinstance(end_date_str, (int, float)):
+            # Unix timestamp
+            return datetime.fromtimestamp(end_date_str, tz=timezone.utc)
+    except (ValueError, TypeError):
+        pass
+
+    return None
+
+
 def _get_current_price(market: dict) -> float | None:
     """Get the current YES token price for a market.
 
@@ -320,6 +375,10 @@ def get_top_mispriced_markets(
     count: int = 5,
     min_volume: float = MIN_VOLUME_USD,
     min_deviation_pct: float = 10.0,
+    min_volume_24h: float | None = None,
+    categories: list[str] | None = None,
+    max_hours_to_settlement: float | None = None,
+    prioritize_politics: bool = False,
 ) -> list[dict]:
     """Get the top mispriced markets sorted by deviation.
 
@@ -327,24 +386,64 @@ def get_top_mispriced_markets(
         count: Number of top markets to return.
         min_volume: Minimum volume threshold in USD.
         min_deviation_pct: Minimum absolute deviation percentage to consider.
+        min_volume_24h: Minimum 24h volume in USD (optional filter).
+        categories: List of allowed categories (e.g., ["crypto", "politics", "economics"]).
+        max_hours_to_settlement: Maximum hours until market settlement (optional filter).
+        prioritize_politics: If True, sort politics markets with >8% deviation higher.
 
     Returns:
         List of top mispriced markets sorted by absolute deviation.
     """
     markets = scan_all_markets(min_volume)
+    now = datetime.now(timezone.utc)
 
     # Filter markets with significant deviation
-    mispriced = [
-        m for m in markets
-        if abs(m["price_deviation"].get("deviation_pct", 0)) >= min_deviation_pct
-        and m["price_deviation"].get("current_price") is not None
-    ]
+    mispriced = []
+    for m in markets:
+        # Check deviation threshold
+        deviation_pct = abs(m["price_deviation"].get("deviation_pct", 0))
+        if deviation_pct < min_deviation_pct:
+            continue
+        if m["price_deviation"].get("current_price") is None:
+            continue
+
+        # Filter by 24h volume if specified
+        if min_volume_24h is not None:
+            volume_24h = _get_market_volume_24h(m)
+            if volume_24h < min_volume_24h:
+                continue
+
+        # Filter by categories if specified
+        if categories is not None:
+            if m.get("category", "other") not in categories:
+                continue
+
+        # Filter by time to settlement if specified
+        if max_hours_to_settlement is not None:
+            end_date = _get_market_end_date(m)
+            if end_date is not None:
+                hours_to_settlement = (end_date - now).total_seconds() / 3600
+                if hours_to_settlement < 0 or hours_to_settlement > max_hours_to_settlement:
+                    continue
+            # If no end_date available, exclude if filter is active
+            else:
+                continue
+
+        mispriced.append(m)
 
     # Sort by absolute deviation percentage (highest first)
-    mispriced.sort(
-        key=lambda m: abs(m["price_deviation"].get("deviation_pct", 0)),
-        reverse=True,
-    )
+    # If prioritize_politics is True, give politics markets with >8% deviation a boost
+    def sort_key(m: dict) -> tuple:
+        deviation = abs(m["price_deviation"].get("deviation_pct", 0))
+        is_politics_high_dev = (
+            prioritize_politics
+            and m.get("category") == "politics"
+            and deviation > 8.0
+        )
+        # Return tuple: (is_priority, deviation) - priority items first, then by deviation
+        return (not is_politics_high_dev, -deviation)
+
+    mispriced.sort(key=sort_key)
 
     return mispriced[:count]
 
