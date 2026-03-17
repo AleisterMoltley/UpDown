@@ -993,7 +993,7 @@ def run_bot(
                 if dry_run:
                     print(
                         f"  [Dry run] Would buy {'YES' if prediction == 'up' else 'NO'} "
-                        f"Kelly size: ${kelly_size:.2f} (edge {kelly_edge:.2f}%)"
+                        f"for ${kelly_size:.2f} USDC. Kelly bet size: ${kelly_size:.2f} (edge {kelly_edge:.2f}%)"
                     )
                 else:
                     outcome = "yes" if prediction == "up" else "no"
