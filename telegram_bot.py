@@ -3892,7 +3892,7 @@ def bot_loop(send_notification):
     """
     global stop_event
 
-    logger.info("Bot loop started - Scanner Mode active")
+    logger.info("Bot loop started – Scanner Mode active – searching mispriced")
 
     # Track previous prediction for flip detection
     previous_prediction = None
@@ -3971,17 +3971,26 @@ def bot_loop(send_notification):
                 deviation_pct = abs(price_deviation.get("deviation_pct", 0))
                 deviation_direction = price_deviation.get("direction", "unknown")
                 
+                # Skip markets with unknown deviation direction
+                if deviation_direction == "unknown":
+                    logger.info(
+                        f"Market '{market.get('question', 'N/A')[:40]}...' - "
+                        f"SKIPPED: Unknown deviation direction"
+                    )
+                    continue
+                
                 # Map deviation direction to signal direction:
                 # - "underpriced" means price is below historical mean → expect price to go UP → signal should be "up"
                 # - "overpriced" means price is above historical mean → expect price to go DOWN → signal should be "down"
                 expected_signal_direction = "up" if deviation_direction == "underpriced" else "down"
                 
                 # Calculate confidence for this market using the multi-signal engine
-                # Pass market_price_deviation to include Polymarket deviation in signal calculation
-                market_deviation_pct = price_deviation.get("deviation_pct", 0)
+                # Pass signed_deviation_pct to include Polymarket deviation in signal calculation
+                # Note: This is the signed value (can be negative), not the absolute percentage
+                signed_deviation_pct = price_deviation.get("deviation_pct", 0)
                 confidence_result = calculate_confidence(
                     closes,
-                    market_price_deviation=market_deviation_pct,
+                    market_price_deviation=signed_deviation_pct,
                     market=market,
                 )
                 

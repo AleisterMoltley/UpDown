@@ -924,7 +924,7 @@ def run_bot(
 
     Args:
         crypto_id: CoinGecko asset ID (e.g. ``'bitcoin'``).
-        query_terms: Deprecated - kept for backward compatibility but not used in Scanner-First mode.
+        query_terms: Deprecated - kept for backward compatibility but not used in scanner-first mode.
         trade_amount: USDC amount per trade.
         dry_run: When *True*, market data and predictions are logged but no
                  orders are submitted.
@@ -1002,6 +1002,14 @@ def run_bot(
             price_deviation = market.get("price_deviation", {})
             deviation_pct = abs(price_deviation.get("deviation_pct", 0))
             deviation_direction = price_deviation.get("direction", "unknown")
+            
+            # Skip markets with unknown deviation direction
+            if deviation_direction == "unknown":
+                print(
+                    f"  ✗ Market: {market.get('question', 'N/A')[:50]}... "
+                    f"SKIPPED: Unknown deviation direction"
+                )
+                continue
             
             # Map deviation direction to expected signal direction:
             # - "underpriced" means price is below historical mean → expect price to go UP → signal should be "up"
