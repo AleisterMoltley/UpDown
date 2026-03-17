@@ -896,21 +896,37 @@ def place_trade(
         bids = order_book.get("bids", [])
         asks = order_book.get("asks", [])
         
-        # Get best bid and ask prices for midpoint calculation
-        best_bid = float(bids[0].get("price", 0)) if bids else 0.0
-        best_ask = float(asks[0].get("price", 1)) if asks else 1.0
-        mid = (best_bid + best_ask) / 2 if (best_bid > 0 and best_ask > 0) else 0.5
-        
-        # Calculate total bid and ask volumes
-        bid_volume = sum(float(b.get("size", 0)) for b in bids)
-        ask_volume = sum(float(a.get("size", 0)) for a in asks)
-        total_volume = bid_volume + ask_volume
-        
-        # Calculate imbalance: (bid_volume - ask_volume) / (bid + ask)
-        imbalance = (bid_volume - ask_volume) / total_volume if total_volume > 0 else 0.0
+        # Handle empty orderbook by falling back to default midpoint
+        if not bids and not asks:
+            mid = 0.5
+            imbalance = 0.0
+            print("Orderbook empty, using default midpoint")
+        else:
+            # Get best bid and ask prices for midpoint calculation
+            best_bid = float(bids[0].get("price", 0)) if bids else 0.0
+            best_ask = float(asks[0].get("price", 1)) if asks else 1.0
+            
+            # Calculate midpoint - use default if we can't calculate from orderbook
+            if best_bid > 0 and best_ask > 0:
+                mid = (best_bid + best_ask) / 2
+            elif best_bid > 0:
+                mid = best_bid
+            elif best_ask > 0 and best_ask < 1.0:
+                mid = best_ask
+            else:
+                mid = 0.5
+            
+            # Calculate total bid and ask volumes
+            bid_volume = sum(float(b.get("size", 0)) for b in bids)
+            ask_volume = sum(float(a.get("size", 0)) for a in asks)
+            total_volume = bid_volume + ask_volume
+            
+            # Calculate imbalance: (bid_volume - ask_volume) / (bid + ask)
+            # Only calculate if we have volume data
+            imbalance = (bid_volume - ask_volume) / total_volume if total_volume > 0 else 0.0
         
         # Apply price edge when imbalance is favorable for YES buys
-        # Positive imbalance = more bids than asks = bullish
+        # Positive imbalance = more bids than asks = strong bid support
         price = mid
         if imbalance > ORDERBOOK_IMBALANCE_THRESHOLD and outcome.lower() == "yes":
             price = mid * ORDERBOOK_PRICE_EDGE
