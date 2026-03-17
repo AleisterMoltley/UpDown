@@ -26,6 +26,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+import numpy as np
 import requests
 from dotenv import load_dotenv
 from pycoingecko import CoinGeckoAPI
@@ -122,7 +123,7 @@ DEFAULT_CONFIG = {
     "auto_matic_topup_min_profit": 0.5,  # Minimum Profit in USD für Top-Up
     "auto_matic_topup_amount": 0.20,  # USDC → MATIC Swap-Betrag
     # Multi-Signal Trading Engine Settings
-    "min_confidence_threshold": 70,  # Minimum confidence (0-100) to execute trades
+    "min_confidence_threshold": 68,  # Minimum confidence (0-100) to execute trades
     "rsi_period": 14,  # RSI calculation period
     "macd_fast_period": 12,  # MACD fast EMA period
     "macd_slow_period": 26,  # MACD slow EMA period
@@ -197,6 +198,13 @@ _last_settlement_check: float = 0.0  # Timestamp of last settlement check
 # Cache structure: {"api_key": str, "api_secret": str, "api_passphrase": str, "derived_at": float}
 _l2_credentials_cache: dict | None = None
 _L2_CREDENTIALS_TTL_SECONDS = 3600  # 1 hour TTL
+
+# ---------------------------------------------------------------------------
+# Logistic Regression Model Cache
+# ---------------------------------------------------------------------------
+# Cache structure: {"weights": np.ndarray, "bias": float, "trained_at": float}
+_logreg_model_cache: dict | None = None
+_LOGREG_MODEL_TTL_SECONDS = 3600  # 1 hour TTL (re-train every hour)
 
 # ---------------------------------------------------------------------------
 # Config persistence
@@ -1430,6 +1438,275 @@ POLYMARKET_DELTA_MAX_STRENGTH_FACTOR = 500  # Max strength at 20% price differen
 POLYMARKET_DELTA_THRESHOLD = 0.02  # Minimum delta to signal a direction
 AGREEMENT_BONUS_PER_SIGNAL = 10  # Confidence bonus per agreeing signal
 
+# Logistic Regression constants
+LOGREG_TRAINING_DAYS = 7  # Days of historical data for training
+LOGREG_FEATURE_WINDOW = 14  # Minimum data points needed for feature calculation
+LOGREG_MIN_TRAINING_SAMPLES = 20  # Minimum samples required for reliable model training
+LOGREG_AGREEMENT_BONUS_CAP = 5  # Maximum bonus (%) for LogReg agreement with main prediction
+# Confidence bonus formula: (logreg_confidence - 50) / 10
+# - 50 is the neutral point (50% probability = no directional confidence)
+# - Division by 10 scales the bonus to 0-5% range (e.g., 100% confidence → 5% bonus)
+
+# Polymarket deviation scaling
+POLYMARKET_DEVIATION_STRENGTH_SCALE = 5  # Scaling factor: 20% deviation = 100% strength
+
+
+def sigmoid(x: float) -> float:
+    """Compute sigmoid function with overflow protection.
+    
+    Args:
+        x: Input value.
+    
+    Returns:
+        Sigmoid of x, clamped between 0 and 1.
+    """
+    # Clip to avoid overflow in exp
+    x = np.clip(x, -500, 500)
+    return 1.0 / (1.0 + np.exp(-x))
+
+
+def fetch_7day_historical_data(crypto_id: str = "bitcoin") -> list | None:
+    """Fetch 7 days of price data from CoinGecko for model training.
+    
+    Note: CoinGecko's market_chart endpoint returns only price data, not true OHLC.
+    We simulate OHLC format for compatibility, with all values being the same price.
+    
+    Args:
+        crypto_id: Cryptocurrency ID for CoinGecko API.
+    
+    Returns:
+        List of [timestamp, price, price, price, price] (simulated OHLC) or None on error.
+    """
+    try:
+        # CoinGecko returns hourly data when days <= 90
+        data = cg.get_coin_market_chart_by_id(
+            id=crypto_id,
+            vs_currency="usd",
+            days=LOGREG_TRAINING_DAYS,
+        )
+        
+        if not data or "prices" not in data:
+            return None
+        
+        # Convert to OHLC-like format (CoinGecko market_chart only provides prices, not true OHLC)
+        # All OHLC values are identical as we only have the spot price at each timestamp
+        prices = data.get("prices", [])
+        return [[p[0], p[1], p[1], p[1], p[1]] for p in prices]
+    except Exception as e:
+        logger.error(f"Error fetching 7-day historical data: {e}")
+        return None
+
+
+def prepare_logreg_features(closes: list) -> np.ndarray | None:
+    """Prepare feature vector for logistic regression from price data.
+    
+    Features:
+    - Normalized RSI (scaled 0-1)
+    - Normalized MACD histogram (scaled -1 to 1)
+    - MA crossover signal (-1, 0, or 1)
+    - Price momentum (% change over last N periods)
+    
+    Args:
+        closes: List of closing prices.
+    
+    Returns:
+        numpy array of features or None if insufficient data.
+    """
+    if len(closes) < LOGREG_FEATURE_WINDOW:
+        return None
+    
+    try:
+        # RSI (normalize to 0-1)
+        rsi = calculate_rsi(closes) / 100.0
+        
+        # MACD histogram (normalize relative to price)
+        macd_data = calculate_macd(closes)
+        if macd_data.get("valid"):
+            hist = macd_data["histogram"]
+            # Use mean of recent non-zero prices as fallback for normalization
+            recent_prices = [p for p in closes[-20:] if p > 0]
+            if recent_prices:
+                current_price = recent_prices[-1]
+            else:
+                # No valid prices - return None to signal insufficient data
+                return None
+            # Normalize to roughly -1 to 1 range relative to 1% of price
+            normalized_hist = np.clip(hist / (current_price * 0.01), -1, 1)
+        else:
+            normalized_hist = 0.0
+        
+        # MA crossover signal
+        short_window = bot_config.get("short_window", 5)
+        long_window = bot_config.get("long_window", 20)
+        if len(closes) >= long_window:
+            ma_short = sum(closes[-short_window:]) / short_window
+            ma_long = sum(closes[-long_window:]) / long_window
+            ma_signal = 1.0 if ma_short > ma_long else -1.0
+        else:
+            ma_signal = 0.0
+        
+        # Price momentum (% change over last 5 periods)
+        if len(closes) >= 6 and closes[-6] > 0:
+            momentum = (closes[-1] - closes[-6]) / closes[-6]
+            momentum = np.clip(momentum, -0.1, 0.1) * 10  # Scale to roughly -1 to 1
+        else:
+            momentum = 0.0
+        
+        return np.array([rsi, normalized_hist, ma_signal, momentum])
+    except Exception as e:
+        logger.error(f"Error preparing LogReg features: {e}")
+        return None
+
+
+def create_training_labels(closes: list, lookahead: int = 1) -> np.ndarray:
+    """Create binary labels for training (1 = price went up, 0 = price went down).
+    
+    Args:
+        closes: List of closing prices.
+        lookahead: Number of periods to look ahead for labeling.
+    
+    Returns:
+        numpy array of binary labels.
+    """
+    labels = []
+    for i in range(len(closes) - lookahead):
+        if closes[i + lookahead] > closes[i]:
+            labels.append(1)
+        else:
+            labels.append(0)
+    return np.array(labels)
+
+
+def train_logreg_model(X: np.ndarray, y: np.ndarray, learning_rate: float = 0.1, iterations: int = 100) -> tuple:
+    """Train a simple logistic regression model using gradient descent.
+    
+    Args:
+        X: Feature matrix (n_samples, n_features).
+        y: Binary labels (n_samples,).
+        learning_rate: Gradient descent learning rate.
+        iterations: Number of training iterations.
+    
+    Returns:
+        Tuple of (weights, bias).
+    """
+    n_samples, n_features = X.shape
+    weights = np.zeros(n_features)
+    bias = 0.0
+    
+    for _ in range(iterations):
+        # Forward pass
+        linear = np.dot(X, weights) + bias
+        predictions = sigmoid(linear)
+        
+        # Gradient descent
+        dw = (1 / n_samples) * np.dot(X.T, (predictions - y))
+        db = (1 / n_samples) * np.sum(predictions - y)
+        
+        weights -= learning_rate * dw
+        bias -= learning_rate * db
+    
+    return weights, bias
+
+
+def get_logreg_model() -> dict | None:
+    """Get or train the logistic regression model.
+    
+    Uses cached model if available and not expired, otherwise trains a new one.
+    
+    Returns:
+        Dict with 'weights' and 'bias', or None if training failed.
+    """
+    global _logreg_model_cache
+    
+    # Check cache
+    if _logreg_model_cache is not None:
+        trained_at = _logreg_model_cache.get("trained_at", 0)
+        if time.time() - trained_at < _LOGREG_MODEL_TTL_SECONDS:
+            return _logreg_model_cache
+    
+    # Train new model
+    try:
+        crypto_id = bot_config.get("crypto_id", "bitcoin")
+        historical_data = fetch_7day_historical_data(crypto_id)
+        
+        if not historical_data or len(historical_data) < LOGREG_FEATURE_WINDOW * 2:
+            logger.warning("Insufficient historical data for LogReg training")
+            return None
+        
+        closes = [d[4] for d in historical_data]  # Extract closing prices
+        
+        # Create feature matrix and labels
+        X_list = []
+        y_list = []
+        
+        for i in range(LOGREG_FEATURE_WINDOW, len(closes) - 1):
+            features = prepare_logreg_features(closes[:i+1])
+            if features is not None:
+                X_list.append(features)
+                # Label: 1 if next price is higher, 0 otherwise
+                y_list.append(1 if closes[i + 1] > closes[i] else 0)
+        
+        if len(X_list) < LOGREG_MIN_TRAINING_SAMPLES:
+            logger.warning(f"Not enough training samples for LogReg (need {LOGREG_MIN_TRAINING_SAMPLES}, have {len(X_list)})")
+            return None
+        
+        X = np.array(X_list)
+        y = np.array(y_list)
+        
+        # Train model
+        weights, bias = train_logreg_model(X, y)
+        
+        _logreg_model_cache = {
+            "weights": weights,
+            "bias": bias,
+            "trained_at": time.time(),
+            "samples": len(X_list),
+        }
+        
+        logger.info(f"LogReg model trained on {len(X_list)} samples")
+        return _logreg_model_cache
+        
+    except Exception as e:
+        logger.error(f"Error training LogReg model: {e}")
+        return None
+
+
+def predict_with_logreg(closes: list) -> dict | None:
+    """Make prediction using the logistic regression model.
+    
+    Args:
+        closes: List of closing prices.
+    
+    Returns:
+        Dict with 'direction' and 'probability', or None if prediction failed.
+    """
+    model = get_logreg_model()
+    if model is None:
+        return None
+    
+    features = prepare_logreg_features(closes)
+    if features is None:
+        return None
+    
+    try:
+        weights = model["weights"]
+        bias = model["bias"]
+        
+        linear = np.dot(features, weights) + bias
+        probability = sigmoid(linear)
+        
+        direction = "up" if probability > 0.5 else "down"
+        confidence = abs(probability - 0.5) * 2 * 100  # Convert to 0-100 scale
+        
+        return {
+            "direction": direction,
+            "probability": probability,
+            "confidence": confidence,
+        }
+    except Exception as e:
+        logger.error(f"Error in LogReg prediction: {e}")
+        return None
+
 
 def calculate_ema(prices: list, period: int) -> list:
     """Calculate Exponential Moving Average (EMA).
@@ -1757,20 +2034,32 @@ def calculate_polymarket_delta_signal(market_price: float, fair_value: float) ->
     }
 
 
-def calculate_confidence_score(closes: list, market: dict | None = None) -> dict:
-    """Calculate overall confidence score combining all signals.
+def calculate_confidence(closes: list, market_price_deviation: float | None = None, market: dict | None = None) -> dict:
+    """Calculate overall confidence score combining all signals (Multi-Signal Engine).
+    
+    This is the main prediction engine that combines:
+    - MA Crossover signal (30% weight)
+    - RSI (14) with Overbought/Oversold detection (30% weight)
+    - MACD (12, 26, 9) (25% weight)
+    - Polymarket deviation_pct from scanner (15% weight)
+    
+    Also includes a logistic regression fallback trained on 7 days of historical data.
     
     Args:
         closes: List of closing prices.
-        market: Optional Polymarket market for price delta.
+        market_price_deviation: Optional Polymarket price deviation percentage from scanner.
+                                Positive = underpriced (bullish), Negative = overpriced (bearish).
+        market: Optional Polymarket market for additional price delta info.
     
     Returns:
         Dictionary with:
-        - prediction: 'up', 'down', or 'hold'
-        - confidence: Overall confidence score (0-100)
+        - direction: 'up' or 'down' (or 'hold' if insufficient data)
+        - confidence_score: Overall confidence score (0-100)
         - signals: Individual signal details
         - fair_value: Estimated fair value for YES token
+        - logreg_prediction: Logistic regression prediction (if available)
     """
+    # Signal weights as specified in requirements
     weights = bot_config.get("signal_weights", {
         "ma_crossover": 30,
         "rsi": 30,
@@ -1799,22 +2088,39 @@ def calculate_confidence_score(closes: list, market: dict | None = None) -> dict
     
     # Calculate fair value for Polymarket (0-1 scale)
     # Higher up_score = higher fair value for YES
-    # Guard against division by zero if all weights are somehow zero
     if total_weight > 0:
         technical_fair_value = 0.5 + (up_score - down_score) / (total_weight * 2)
     else:
-        technical_fair_value = 0.5  # Default neutral fair value
-    technical_fair_value = max(0.1, min(0.9, technical_fair_value))  # Clamp to reasonable range
+        technical_fair_value = 0.5
+    technical_fair_value = max(0.1, min(0.9, technical_fair_value))
     
-    # Get Polymarket price delta
-    polymarket_data = get_polymarket_price_delta(market)
-    polymarket_data["fair_value"] = technical_fair_value
-    polymarket_data["delta"] = technical_fair_value - polymarket_data["market_price"]
-    
-    polymarket_signal = calculate_polymarket_delta_signal(
-        polymarket_data["market_price"],
-        technical_fair_value
-    )
+    # Handle Polymarket deviation from scanner (if provided)
+    if market_price_deviation is not None:
+        # Convert deviation_pct to a signal
+        # Positive deviation = market underpriced = bullish
+        # Negative deviation = market overpriced = bearish
+        pm_direction = "up" if market_price_deviation > 0 else "down" if market_price_deviation < 0 else "neutral"
+        # Scale strength: using POLYMARKET_DEVIATION_STRENGTH_SCALE (5 = 20% deviation → 100% strength)
+        pm_strength = min(100, abs(market_price_deviation) * POLYMARKET_DEVIATION_STRENGTH_SCALE)
+        polymarket_signal = {
+            "direction": pm_direction,
+            "strength": pm_strength,
+            "delta": market_price_deviation / 100,  # Convert to decimal
+            "deviation_pct": market_price_deviation,
+        }
+        # Store actual market_price for return value
+        pm_market_price = 0.5 + (market_price_deviation / 200)  # Estimate: 50% ± deviation/2
+    else:
+        # Fallback: get Polymarket price delta from market data
+        polymarket_data = get_polymarket_price_delta(market)
+        polymarket_data["fair_value"] = technical_fair_value
+        polymarket_data["delta"] = technical_fair_value - polymarket_data["market_price"]
+        pm_market_price = polymarket_data["market_price"]
+        
+        polymarket_signal = calculate_polymarket_delta_signal(
+            polymarket_data["market_price"],
+            technical_fair_value
+        )
     
     # Add Polymarket delta to scores
     polymarket_weight = weights.get("polymarket_delta", 15)
@@ -1825,11 +2131,36 @@ def calculate_confidence_score(closes: list, market: dict | None = None) -> dict
     elif polymarket_signal["direction"] == "down":
         down_score += polymarket_weight * (polymarket_signal["strength"] / 100)
     
-    # Determine final prediction (guard against zero total_weight)
+    # Get logistic regression prediction (fallback/confirmation)
+    logreg_pred = predict_with_logreg(closes)
+    logreg_signal = None
+    if logreg_pred is not None:
+        logreg_signal = {
+            "direction": logreg_pred["direction"],
+            "confidence": logreg_pred["confidence"],
+            "probability": logreg_pred["probability"],
+        }
+        # If LogReg agrees with main prediction, add small confidence bonus
+        # This serves as a confirmation signal
+        # Formula: bonus = (confidence - 50) / 10, capped at LOGREG_AGREEMENT_BONUS_CAP
+        # - 50 is neutral (50% probability = no directional confidence)
+        # - Division by 10 scales to 0-5% range (e.g., 100% confidence → 5% bonus)
+        if logreg_pred["confidence"] > 60:  # Only if LogReg is confident
+            if (logreg_pred["direction"] == "up" and up_score > down_score) or \
+               (logreg_pred["direction"] == "down" and down_score > up_score):
+                agreement_factor = min(LOGREG_AGREEMENT_BONUS_CAP, (logreg_pred["confidence"] - 50) / 10)
+            else:
+                agreement_factor = 0
+        else:
+            agreement_factor = 0
+    else:
+        agreement_factor = 0
+    
+    # Determine final prediction
     if total_weight <= 0:
         return {
-            "prediction": "hold",
-            "confidence": 0,
+            "direction": "hold",
+            "confidence_score": 0,
             "signals": {
                 "ma_crossover": ma_signal,
                 "rsi": rsi_signal,
@@ -1837,33 +2168,40 @@ def calculate_confidence_score(closes: list, market: dict | None = None) -> dict
                 "polymarket_delta": polymarket_signal,
             },
             "fair_value": 0.5,
-            "polymarket_price": polymarket_data["market_price"],
+            "polymarket_price": 0.5,
             "up_score": 0,
             "down_score": 0,
+            "logreg_prediction": logreg_signal,
         }
     
     if up_score > down_score:
-        prediction = "up"
+        direction = "up"
         confidence = (up_score / total_weight) * 100
     elif down_score > up_score:
-        prediction = "down"
+        direction = "down"
         confidence = (down_score / total_weight) * 100
     else:
-        prediction = "hold"
+        direction = "hold"
         confidence = 0
     
     # Adjust confidence based on signal agreement
     directions = [ma_signal["direction"], rsi_signal["direction"], macd_signal["direction"]]
-    agreement_count = sum(1 for d in directions if d == prediction)
+    agreement_count = sum(1 for d in directions if d == direction)
     
     # Bonus for signal agreement (up to 20% bonus for all signals agreeing)
     if agreement_count >= 2:
         agreement_bonus = (agreement_count - 1) * AGREEMENT_BONUS_PER_SIGNAL
         confidence = min(100, confidence + agreement_bonus)
     
+    # Add LogReg agreement bonus
+    confidence = min(100, confidence + agreement_factor)
+    
+    # Build result - return both 'confidence_score' (new) and 'confidence' (backward compat)
     return {
-        "prediction": prediction,
-        "confidence": round(confidence, 1),
+        "direction": direction,
+        "confidence_score": round(confidence, 1),
+        "confidence": round(confidence, 1),  # Backward compatibility
+        "prediction": direction,  # Backward compatibility
         "signals": {
             "ma_crossover": ma_signal,
             "rsi": rsi_signal,
@@ -1871,28 +2209,42 @@ def calculate_confidence_score(closes: list, market: dict | None = None) -> dict
             "polymarket_delta": polymarket_signal,
         },
         "fair_value": technical_fair_value,
-        "polymarket_price": polymarket_data["market_price"],
+        "polymarket_price": pm_market_price,
         "up_score": up_score,
         "down_score": down_score,
+        "logreg_prediction": logreg_signal,
     }
 
 
-def predict_up_down(closes: list) -> str:
-    """Predict the next price direction using a moving-average crossover.
+def calculate_confidence_score(closes: list, market: dict | None = None) -> dict:
+    """Legacy wrapper for calculate_confidence() for backward compatibility.
     
-    Note: This is the legacy function for backward compatibility.
-    Use calculate_confidence_score() for the new multi-signal engine.
+    Note: This is deprecated. Use calculate_confidence() directly.
+    
+    Args:
+        closes: List of closing prices.
+        market: Optional Polymarket market for price delta.
+    
+    Returns:
+        Dictionary with prediction info (same as calculate_confidence).
     """
-    short_window = bot_config.get("short_window", 5)
-    long_window = bot_config.get("long_window", 20)
+    return calculate_confidence(closes, market_price_deviation=None, market=market)
 
-    if len(closes) < long_window:
-        return "hold"
 
-    ma_short = sum(closes[-short_window:]) / short_window
-    ma_long = sum(closes[-long_window:]) / long_window
-
-    return "up" if ma_short > ma_long else "down"
+def predict_up_down(closes: list) -> str:
+    """Predict the next price direction.
+    
+    Note: This is a legacy function for backward compatibility.
+    Use calculate_confidence() for the new multi-signal engine with confidence scores.
+    
+    Args:
+        closes: List of closing prices.
+    
+    Returns:
+        'up', 'down', or 'hold'
+    """
+    result = calculate_confidence(closes)
+    return result.get("direction", "hold")
 
 
 def get_current_prediction() -> dict:
@@ -1908,6 +2260,7 @@ def get_current_prediction() -> dict:
         - signals: Individual signal details (ma_crossover, rsi, macd, polymarket_delta)
         - fair_value: Estimated fair value for YES token
         - meets_threshold: Whether confidence meets minimum threshold for trading
+        - logreg_prediction: Logistic regression prediction (if available)
         - error: Error message (only present on failure)
     """
     try:
@@ -1916,34 +2269,40 @@ def get_current_prediction() -> dict:
         closes = [candle[4] for candle in ohlc]
         current_price = closes[-1] if closes else 0
         
-        # Use multi-signal engine for prediction
-        confidence_result = calculate_confidence_score(closes)
+        # Use new multi-signal engine with logistic regression fallback
+        confidence_result = calculate_confidence(closes)
         
-        min_threshold = bot_config.get("min_confidence_threshold", 70)
-        meets_threshold = confidence_result["confidence"] >= min_threshold
+        # Use new default threshold of 68
+        min_threshold = bot_config.get("min_confidence_threshold", 68)
+        confidence_score = confidence_result.get("confidence_score", confidence_result.get("confidence", 0))
+        meets_threshold = confidence_score >= min_threshold
         
         return {
-            "prediction": confidence_result["prediction"],
-            "confidence": confidence_result["confidence"],
+            "prediction": confidence_result.get("direction", confidence_result.get("prediction", "hold")),
+            "confidence": confidence_score,
+            "confidence_score": confidence_score,
             "price": current_price,
             "candles": len(closes),
             "crypto": crypto_id,
-            "signals": confidence_result["signals"],
-            "fair_value": confidence_result["fair_value"],
+            "signals": confidence_result.get("signals", {}),
+            "fair_value": confidence_result.get("fair_value", 0.5),
             "polymarket_price": confidence_result.get("polymarket_price", 0.5),
             "meets_threshold": meets_threshold,
             "min_threshold": min_threshold,
+            "logreg_prediction": confidence_result.get("logreg_prediction"),
         }
     except ConnectionError as e:
         logger.error(f"Connection error getting prediction: {e}")
         return {
             "prediction": "unavailable",
             "confidence": 0,
+            "confidence_score": 0,
             "price": 0,
             "candles": 0,
             "crypto": bot_config.get("crypto_id", "unknown"),
             "signals": {},
             "meets_threshold": False,
+            "logreg_prediction": None,
             "error": (
                 "Unable to connect to CoinGecko API. "
                 "Verify network connectivity and ensure api.coingecko.com is not blocked by firewall rules."
@@ -1954,11 +2313,13 @@ def get_current_prediction() -> dict:
         return {
             "prediction": "error",
             "confidence": 0,
+            "confidence_score": 0,
             "price": 0,
             "candles": 0,
             "crypto": bot_config.get("crypto_id", "unknown"),
             "signals": {},
             "meets_threshold": False,
+            "logreg_prediction": None,
             "error": str(e),
         }
 
@@ -2874,7 +3235,7 @@ def bot_loop(send_notification):
             prediction = pred.get("prediction", "hold")
             confidence = pred.get("confidence", 0)
             meets_threshold = pred.get("meets_threshold", False)
-            min_threshold = pred.get("min_threshold", 70)
+            min_threshold = pred.get("min_threshold", 68)
 
             if prediction == "hold":
                 # Skip the cycle but don't update previous_prediction
@@ -2910,6 +3271,10 @@ def bot_loop(send_notification):
                     f"Confidence {confidence:.1f}% below threshold {min_threshold}% - skipping trade"
                 )
                 # Send notification about skipped trade
+                logreg_info = pred.get("logreg_prediction")
+                logreg_text = ""
+                if logreg_info:
+                    logreg_text = f"\n• LogReg: {logreg_info.get('direction', 'N/A').upper()} ({logreg_info.get('confidence', 0):.0f}%)"
                 send_notification(
                     f"⏸️ **Trade Skipped - Low Confidence**\n\n"
                     f"Prediction: {prediction.upper()}\n"
@@ -2919,6 +3284,7 @@ def bot_loop(send_notification):
                     f"• MA: {signals.get('ma_crossover', {}).get('direction', 'N/A').upper()}\n"
                     f"• RSI: {signals.get('rsi', {}).get('rsi', 0):.1f}\n"
                     f"• MACD: {signals.get('macd', {}).get('direction', 'N/A').upper()}"
+                    f"{logreg_text}"
                 )
                 wait_with_check(bot_config.get("cycle_interval_seconds", 300))
                 continue
@@ -2960,6 +3326,12 @@ def bot_loop(send_notification):
                 deviation_bonus = min(15.0, deviation_pct / 2.0)
                 total_confidence = min(100.0, confidence + deviation_bonus)
 
+                # Build LogReg info string
+                logreg_info = pred.get("logreg_prediction")
+                logreg_text = ""
+                if logreg_info:
+                    logreg_text = f"\n• LogReg: {logreg_info.get('direction', 'N/A').upper()} ({logreg_info.get('confidence', 0):.0f}%)"
+
                 if bot_config.get("dry_run", True):
                     outcome = "YES" if prediction == "up" else "NO"
                     logger.info(f"[Dry run] Would buy {outcome} on {market.get('question')}")
@@ -2983,6 +3355,7 @@ def bot_loop(send_notification):
                         f"• MACD: {signals.get('macd', {}).get('direction', 'N/A').upper()} "
                         f"(hist: {signals.get('macd', {}).get('histogram', 0):.2f})\n"
                         f"• PM Delta: {signals.get('polymarket_delta', {}).get('delta', 0):.3f}"
+                        f"{logreg_text}"
                     )
                 else:
                     outcome = "yes" if prediction == "up" else "no"
@@ -3005,6 +3378,7 @@ def bot_loop(send_notification):
                             f"🎯 Total Confidence: {total_confidence:.1f}%\n"
                             f"Amount: ${trade_amount}\n"
                             f"Price: {result.get('price', 'N/A')}"
+                            f"{logreg_text}"
                         )
                     else:
                         send_notification(
@@ -3214,7 +3588,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # Get multi-signal info
     confidence = pred.get("confidence", 0)
     meets_threshold = pred.get("meets_threshold", False)
-    min_threshold = bot_config.get("min_confidence_threshold", 70)
+    min_threshold = bot_config.get("min_confidence_threshold", 68)
     
     confidence_status = "✅ WILL TRADE" if meets_threshold else f"⏸️ Below {min_threshold}%"
 
@@ -3300,7 +3674,7 @@ async def predict_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     emoji = "📈" if pred.get("prediction") == "up" else "📉" if pred.get("prediction") == "down" else "⏸️"
     confidence = pred.get("confidence", 0)
     meets_threshold = pred.get("meets_threshold", False)
-    min_threshold = pred.get("min_threshold", 70)
+    min_threshold = pred.get("min_threshold", 68)
     
     # Get signal details
     signals = pred.get("signals", {})
@@ -3308,12 +3682,23 @@ async def predict_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     rsi_signal = signals.get("rsi", {})
     macd_signal = signals.get("macd", {})
     pm_signal = signals.get("polymarket_delta", {})
+    logreg_pred = pred.get("logreg_prediction")
     
     # Confidence bar visualization
     confidence_bars = "█" * int(confidence / 10) + "░" * (10 - int(confidence / 10))
     threshold_marker = "▼" if meets_threshold else "▽"
     
     trade_status = "✅ WILL TRADE" if meets_threshold else "⏸️ NO TRADE (low confidence)"
+    
+    # Build LogReg section
+    logreg_text = ""
+    if logreg_pred:
+        logreg_text = f"""
+• **LogReg Fallback** (7-day trained)
+  Prediction: {logreg_pred.get('direction', 'N/A').upper()}
+  Confidence: {logreg_pred.get('confidence', 0):.0f}%
+  Probability: {logreg_pred.get('probability', 0.5):.2%}
+"""
 
     text = f"""
 {emoji} **Multi-Signal Prediction**
@@ -3330,29 +3715,29 @@ Status: {trade_status}
 
 📈 **Signal Details:**
 
-• **MA Crossover** ({bot_config.get('short_window', 5)}/{bot_config.get('long_window', 20)})
+• **MA Crossover** ({bot_config.get('short_window', 5)}/{bot_config.get('long_window', 20)}) - 30%
   Direction: {ma_signal.get('direction', 'N/A').upper()}
   Strength: {ma_signal.get('strength', 0):.0f}%
   Short MA: ${ma_signal.get('ma_short', 0):,.2f}
   Long MA: ${ma_signal.get('ma_long', 0):,.2f}
 
-• **RSI** (Period: {bot_config.get('rsi_period', 14)})
+• **RSI** (Period: {bot_config.get('rsi_period', 14)}) - 30%
   Value: {rsi_signal.get('rsi', 0):.1f}
   Direction: {rsi_signal.get('direction', 'N/A').upper()}
   Strength: {rsi_signal.get('strength', 0):.0f}%
   (Overbought: >{bot_config.get('rsi_overbought', 70)}, Oversold: <{bot_config.get('rsi_oversold', 30)})
 
-• **MACD** ({bot_config.get('macd_fast_period', 12)}/{bot_config.get('macd_slow_period', 26)}/{bot_config.get('macd_signal_period', 9)})
+• **MACD** ({bot_config.get('macd_fast_period', 12)}/{bot_config.get('macd_slow_period', 26)}/{bot_config.get('macd_signal_period', 9)}) - 25%
   Histogram: {macd_signal.get('histogram', 0):.2f}
   Direction: {macd_signal.get('direction', 'N/A').upper()}
   Strength: {macd_signal.get('strength', 0):.0f}%
 
-• **Polymarket Delta**
+• **Polymarket Delta** - 15%
   Market Price: {pred.get('polymarket_price', 0.5):.2%}
   Fair Value: {pred.get('fair_value', 0.5):.2%}
   Delta: {pm_signal.get('delta', 0):.3f}
   Direction: {pm_signal.get('direction', 'N/A').upper()}
-"""
+{logreg_text}"""
     await update.message.reply_text(text, parse_mode="Markdown")
 
 
@@ -3757,7 +4142,7 @@ Cycle Interval: {bot_config.get('cycle_interval_seconds', 300)}s
 Asset: {bot_config.get('crypto_id', 'bitcoin')}
 
 **Multi-Signal Engine:**
-Min Confidence: {bot_config.get('min_confidence_threshold', 70)}%
+Min Confidence: {bot_config.get('min_confidence_threshold', 68)}%
 
 **Signal Weights:**
 • MA Crossover: {weights.get('ma_crossover', 30)}%
@@ -4090,7 +4475,7 @@ async def set_confidence_threshold_start(update: Update, context: ContextTypes.D
 
     await update.message.reply_text(
         f"🎯 **Set Confidence Threshold**\n\n"
-        f"Current: {bot_config.get('min_confidence_threshold', 70)}%\n\n"
+        f"Current: {bot_config.get('min_confidence_threshold', 68)}%\n\n"
         f"Trades are only executed when confidence ≥ this threshold.\n"
         f"Send a value between 0 and 100.\n\n"
         f"Send /cancel to abort.",
@@ -5164,7 +5549,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     elif data == "cfg_confidence":
         text = (
             f"🎯 **Confidence Threshold**\n\n"
-            f"Current: {bot_config.get('min_confidence_threshold', 70)}%\n\n"
+            f"Current: {bot_config.get('min_confidence_threshold', 68)}%\n\n"
             f"Trades only execute when confidence ≥ this value.\n\n"
             f"Use `/set_confidence_threshold` to change."
         )
