@@ -25,6 +25,13 @@ GAMMA_API_BASE = "https://gamma-api.polymarket.com"
 # Minimum volume threshold in USD
 MIN_VOLUME_USD = 10000
 
+# Maximum offset for paginated market fetching (safety limit)
+MAX_FETCH_OFFSET = 5000
+
+# Neutral probability baseline when no historical data is available
+# 0.5 represents a 50% probability - the neutral expectation for a binary market
+NEUTRAL_PROBABILITY_BASELINE = 0.5
+
 # Market categories based on keywords
 CATEGORY_KEYWORDS = {
     "crypto": [
@@ -126,7 +133,7 @@ def fetch_all_active_markets(min_volume: float = MIN_VOLUME_USD) -> list[dict]:
             offset += limit
 
             # Safety limit to avoid infinite loops
-            if offset > 5000:
+            if offset > MAX_FETCH_OFFSET:
                 logger.warning("Reached maximum offset limit for market fetch")
                 break
 
@@ -257,9 +264,9 @@ def calculate_price_deviation(market: dict) -> dict[str, Any]:
 
     price_history = _get_price_history(market)
 
-    # If no history, use 0.5 as baseline (neutral expectation)
+    # Use neutral baseline when no historical data is available
     if not price_history:
-        historical_mean = 0.5
+        historical_mean = NEUTRAL_PROBABILITY_BASELINE
     else:
         historical_mean = sum(price_history) / len(price_history)
 

@@ -44,7 +44,6 @@ from telegram.ext import (
 from market_scanner import (
     format_scan_results,
     get_category_summary,
-    get_top_mispriced_markets,
     scan_all_markets,
 )
 
@@ -2625,14 +2624,25 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text("🔍 Scanning all active markets... This may take a moment.")
 
     try:
-        # Get top 5 mispriced markets with minimum 10% deviation
-        mispriced = get_top_mispriced_markets(count=5, min_deviation_pct=5.0)
+        # Scan all markets once and reuse for both mispriced detection and summary
+        all_markets = scan_all_markets()
+        summary = get_category_summary(all_markets)
+
+        # Filter for mispriced markets (>= 5% deviation)
+        mispriced = [
+            m for m in all_markets
+            if abs(m.get("price_deviation", {}).get("deviation_pct", 0)) >= 5.0
+            and m.get("price_deviation", {}).get("current_price") is not None
+        ]
+        # Sort by absolute deviation and take top 5
+        mispriced.sort(
+            key=lambda m: abs(m.get("price_deviation", {}).get("deviation_pct", 0)),
+            reverse=True,
+        )
+        mispriced = mispriced[:5]
 
         if not mispriced:
             # If no mispriced markets found, show category summary
-            all_markets = scan_all_markets()
-            summary = get_category_summary(all_markets)
-
             text = "📊 **Market Scan Complete**\n\n"
             text += "No significantly mispriced markets found.\n\n"
             text += "**Markets by Category:**\n"
@@ -2646,9 +2656,7 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         # Format and send results
         result_text = format_scan_results(mispriced)
 
-        # Add category summary at the end
-        all_markets = scan_all_markets()
-        summary = get_category_summary(all_markets)
+        # Add category summary at the end (reuse already scanned data)
         result_text += "\n\n**📊 All Markets by Category:**\n"
         for cat, count in sorted(summary.items(), key=lambda x: -x[1]):
             result_text += f"• {cat.capitalize()}: {count}\n"
