@@ -22,6 +22,10 @@ ENV/
 *.key
 bot_config.json
 
+# Runtime data
+daily_pnl.json
+positions.json
+
 # IDE / OS
 .idea/
 .vscode/

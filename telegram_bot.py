@@ -61,6 +61,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 # File paths for persistent storage
 CONFIG_FILE = Path("bot_config.json")
 PNL_FILE = Path("daily_pnl.json")
+POSITIONS_FILE = Path("positions.json")
 
 # Conversation states
 # 100% Onchain Mode: No API credentials needed, only Private Key
@@ -206,6 +207,173 @@ def save_pnl(pnl_data: dict) -> None:
             json.dump(pnl_data, f, indent=2)
     except OSError as e:
         logger.error(f"Could not save P&L: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Positions Store
+# ---------------------------------------------------------------------------
+
+
+def load_positions() -> dict:
+    """Load positions data from file.
+
+    Returns:
+        Dict with 'open' (list of open positions) and 'closed' (list of closed positions).
+        Each position has: market_id, token_id, side, entry_price, amount, timestamp,
+        and optional: exit_price, exit_timestamp, realized_pnl.
+    """
+    if POSITIONS_FILE.exists():
+        try:
+            with open(POSITIONS_FILE, "r") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return {"open": [], "closed": []}
+    return {"open": [], "closed": []}
+
+
+def save_positions(positions_data: dict) -> None:
+    """Save positions data to file."""
+    try:
+        with open(POSITIONS_FILE, "w") as f:
+            json.dump(positions_data, f, indent=2)
+    except OSError as e:
+        logger.error(f"Could not save positions: {e}")
+
+
+def calculate_shares(amount: float, entry_price: float) -> float:
+    """Calculate the number of shares from amount and entry price.
+
+    Args:
+        amount: The USDC amount spent.
+        entry_price: The price per share.
+
+    Returns:
+        Number of shares (amount / entry_price), or 0 if entry_price <= 0.
+    """
+    if entry_price <= 0:
+        return 0.0
+    return amount / entry_price
+
+
+def parse_position_date(timestamp: str) -> str:
+    """Parse timestamp and return date string (YYYY-MM-DD).
+
+    Args:
+        timestamp: ISO format timestamp string.
+
+    Returns:
+        Date string in YYYY-MM-DD format, or "Unknown" on error.
+    """
+    try:
+        dt = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        return dt.strftime("%Y-%m-%d")
+    except (ValueError, AttributeError):
+        return "Unknown"
+
+
+def add_position(
+    market_id: str,
+    token_id: str,
+    side: str,
+    entry_price: float,
+    amount: float,
+    market_question: str = "",
+) -> dict:
+    """Add a new open position to the store.
+
+    Args:
+        market_id: The Polymarket market ID (condition_id).
+        token_id: The token ID (YES or NO token).
+        side: 'yes' or 'no'.
+        entry_price: The entry price per share.
+        amount: The amount in USDC spent.
+        market_question: The market question string (for display).
+
+    Returns:
+        The created position dict.
+    """
+    positions = load_positions()
+    position = {
+        "market_id": market_id,
+        "token_id": token_id,
+        "side": side,
+        "entry_price": entry_price,
+        "amount": amount,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "market_question": market_question,
+    }
+    positions["open"].append(position)
+    save_positions(positions)
+    logger.info(f"Added position: {side.upper()} on market {market_id[:20]}... at ${entry_price:.4f}")
+    return position
+
+
+def close_position(
+    market_id: str,
+    token_id: str,
+    exit_price: float,
+    resolution: str | None = None,
+) -> dict | None:
+    """Close an open position and calculate realized P&L.
+
+    Args:
+        market_id: The Polymarket market ID.
+        token_id: The token ID.
+        exit_price: The exit/settlement price per share.
+        resolution: Optional resolution outcome ('yes', 'no', or None for manual exit).
+
+    Returns:
+        The closed position dict with realized_pnl, or None if not found.
+    """
+    positions = load_positions()
+
+    # Find the position to close - match on both market_id and token_id
+    # to avoid closing wrong position when multiple positions exist
+    position_index = None
+    for i, pos in enumerate(positions["open"]):
+        if pos["token_id"] == token_id and pos.get("market_id", "") == market_id:
+            position_index = i
+            break
+
+    # Fallback: if no exact match, try matching just token_id (backward compatibility)
+    if position_index is None:
+        for i, pos in enumerate(positions["open"]):
+            if pos["token_id"] == token_id:
+                position_index = i
+                break
+
+    if position_index is None:
+        logger.warning(f"Position not found for token_id: {token_id}")
+        return None
+
+    position = positions["open"].pop(position_index)
+
+    # Calculate realized P&L using helper function
+    shares = calculate_shares(position["amount"], position["entry_price"])
+    exit_value = shares * exit_price
+    realized_pnl = exit_value - position["amount"]
+
+    position["exit_price"] = exit_price
+    position["exit_timestamp"] = datetime.now(timezone.utc).isoformat()
+    position["realized_pnl"] = realized_pnl
+    position["resolution"] = resolution
+
+    # Move to closed positions (keep last 100)
+    positions["closed"].append(position)
+    positions["closed"] = positions["closed"][-100:]
+    save_positions(positions)
+
+    logger.info(
+        f"Closed position: {position['side'].upper()} exit at ${exit_price:.4f}, "
+        f"P&L: ${realized_pnl:.2f}"
+    )
+    return position
+
+
+def get_open_positions() -> list:
+    """Get all open positions."""
+    positions = load_positions()
+    return positions.get("open", [])
 
 
 def record_trade(amount: float, profit: float = 0.0) -> None:
@@ -982,9 +1150,238 @@ def place_trade(market: dict, outcome: str = "yes", amount: float = 10.0) -> dic
         signed_order = clob.sign_order(order)
         resp = clob.post_order(signed_order)
         record_trade(amount)
-        return {"success": True, "response": resp, "price": price}
+
+        # Record the position for tracking
+        market_id = market.get("id") or market.get("condition_id") or ""
+        market_question = market.get("question", "")
+        add_position(
+            market_id=market_id,
+            token_id=token_id,
+            side=outcome.lower(),
+            entry_price=price,
+            amount=amount,
+            market_question=market_question,
+        )
+
+        return {"success": True, "response": resp, "price": price, "token_id": token_id}
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+
+def get_market_by_id(market_id: str) -> dict | None:
+    """Fetch a specific market by ID from Gamma API.
+
+    Args:
+        market_id: The Polymarket market ID (condition_id).
+
+    Returns:
+        Market dict or None if not found.
+    """
+    try:
+        url = f"{GAMMA_API_BASE}/markets/{market_id}"
+        response = requests.get(url, timeout=15)
+        if response.status_code == 404:
+            return None
+        response.raise_for_status()
+        return response.json()
+    except requests.RequestException as e:
+        logger.error(f"Error fetching market {market_id}: {e}")
+        return None
+
+
+def check_resolved_markets() -> list:
+    """Check open positions for resolved markets and calculate realized P&L.
+
+    Returns:
+        List of closed position results with P&L info.
+    """
+    open_positions = get_open_positions()
+    if not open_positions:
+        return []
+
+    closed_results = []
+
+    for position in open_positions:
+        market_id = position.get("market_id", "")
+        if not market_id:
+            continue
+
+        market = get_market_by_id(market_id)
+        if market is None:
+            continue
+
+        # Check if market is resolved (closed == True or end_date_iso in the past)
+        is_closed = market.get("closed", False)
+        # Gamma API uses camelCase, but check both for compatibility
+        resolution_outcome = market.get("resolvedOutcome") or market.get("resolved_outcome")
+
+        if is_closed and resolution_outcome:
+            # Market resolved - determine settlement price
+            side = position.get("side", "").lower()
+            token_id = position.get("token_id", "")
+
+            # Settlement price: 1.0 if position side wins, 0.0 if it loses
+            if resolution_outcome.lower() == side:
+                exit_price = 1.0
+            else:
+                exit_price = 0.0
+
+            # Close the position
+            closed = close_position(
+                market_id=market_id,
+                token_id=token_id,
+                exit_price=exit_price,
+                resolution=resolution_outcome,
+            )
+
+            if closed:
+                # Record the P&L in daily totals
+                record_trade(0, closed.get("realized_pnl", 0))
+                closed_results.append({
+                    "position": closed,
+                    "market_question": position.get("market_question", ""),
+                    "resolution": resolution_outcome,
+                })
+
+    return closed_results
+
+
+def sell_position(position: dict) -> dict:
+    """Sell/exit a position by posting a sell order at market midpoint.
+
+    Args:
+        position: The position dict from the positions store.
+
+    Returns:
+        Dict with success status and order details.
+    """
+    clob = _build_clob_client()
+    if clob is None:
+        return {"success": False, "error": "CLOB client not initialized"}
+
+    token_id = position.get("token_id", "")
+    if not token_id:
+        return {"success": False, "error": "No token_id in position"}
+
+    try:
+        # Get current midpoint price
+        mid = clob.get_midpoint(token_id)
+        exit_price = float(mid) if mid else 0.5
+
+        # Calculate shares to sell using helper function
+        entry_price = position.get("entry_price", 0)
+        amount = position.get("amount", 0)
+        shares = calculate_shares(amount, entry_price)
+
+        if shares <= 0:
+            return {"success": False, "error": "No shares to sell"}
+
+        # Create sell order at midpoint
+        order = clob.create_order(
+            token_id=token_id,
+            price=exit_price,
+            side="sell",
+            size=shares,
+        )
+        signed_order = clob.sign_order(order)
+        resp = clob.post_order(signed_order)
+
+        # Check if order was accepted
+        # The CLOB API typically returns a dict with orderID on success
+        order_success = False
+        if resp is not None:
+            if isinstance(resp, dict):
+                # Check for common success indicators
+                order_success = "orderID" in resp or "id" in resp or resp.get("success", False)
+            else:
+                # Non-dict response, assume success if not None
+                order_success = True
+
+        if not order_success:
+            logger.warning(f"Sell order may not have been accepted for token {token_id}: {resp}")
+
+        # Close the position in our store
+        market_id = position.get("market_id", "")
+        closed = close_position(
+            market_id=market_id,
+            token_id=token_id,
+            exit_price=exit_price,
+            resolution=None,  # Manual exit, not market resolution
+        )
+
+        if closed:
+            record_trade(0, closed.get("realized_pnl", 0))
+
+        return {
+            "success": True,
+            "response": resp,
+            "exit_price": exit_price,
+            "shares_sold": shares,
+            "realized_pnl": closed.get("realized_pnl", 0) if closed else 0,
+            "order_posted": order_success,
+        }
+
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def check_prediction_flip_and_exit(current_prediction: str, send_notification) -> list:
+    """Check if prediction has flipped and exit positions accordingly.
+
+    If the bot's prediction changes direction (e.g., from 'up' to 'down'),
+    positions that are now against the prediction should be sold.
+
+    Args:
+        current_prediction: Current prediction ('up' or 'down').
+        send_notification: Callback to send Telegram notification.
+
+    Returns:
+        List of closed position results.
+    """
+    open_positions = get_open_positions()
+    if not open_positions:
+        return []
+
+    closed_results = []
+
+    for position in open_positions:
+        side = position.get("side", "").lower()
+
+        # Determine if position is against current prediction
+        # 'up' prediction means YES is good, NO should be exited
+        # 'down' prediction means NO is good, YES should be exited
+        should_exit = False
+        if current_prediction == "up" and side == "no":
+            should_exit = True
+        elif current_prediction == "down" and side == "yes":
+            should_exit = True
+
+        if should_exit:
+            logger.info(
+                f"Prediction flipped to {current_prediction}, "
+                f"exiting {side.upper()} position"
+            )
+
+            result = sell_position(position)
+
+            if result.get("success"):
+                closed_results.append({
+                    "position": position,
+                    "exit_price": result.get("exit_price"),
+                    "realized_pnl": result.get("realized_pnl"),
+                    "reason": "prediction_flip",
+                })
+                send_notification(
+                    f"🔄 **Position Exited (Prediction Flip)**\n\n"
+                    f"Market: {position.get('market_question', 'N/A')[:50]}...\n"
+                    f"Side: {side.upper()}\n"
+                    f"Exit Price: ${result.get('exit_price', 0):.4f}\n"
+                    f"P&L: ${result.get('realized_pnl', 0):.2f}"
+                )
+            else:
+                logger.error(f"Failed to exit position: {result.get('error')}")
+
+    return closed_results
 
 
 # ---------------------------------------------------------------------------
@@ -1139,6 +1536,9 @@ def bot_loop(send_notification):
 
     logger.info("Bot loop started")
 
+    # Track previous prediction for flip detection
+    previous_prediction = None
+
     while not stop_event.is_set():
         try:
             # Check and fund Polygon if needed
@@ -1150,14 +1550,48 @@ def bot_loop(send_notification):
                     f"Tx: `{fund_result.get('tx', 'N/A')}`"
                 )
 
+            # Check for resolved markets and auto-calculate P&L
+            if not bot_config.get("dry_run", True):
+                try:
+                    resolved = check_resolved_markets()
+                    for result in resolved:
+                        pos = result.get("position", {})
+                        send_notification(
+                            f"📊 **Market Resolved**\n\n"
+                            f"Market: {result.get('market_question', 'N/A')[:50]}...\n"
+                            f"Resolution: {result.get('resolution', 'N/A').upper()}\n"
+                            f"Your Side: {pos.get('side', 'N/A').upper()}\n"
+                            f"Entry: ${pos.get('entry_price', 0):.4f}\n"
+                            f"Settlement: ${pos.get('exit_price', 0):.4f}\n"
+                            f"Realized P&L: ${pos.get('realized_pnl', 0):.2f}"
+                        )
+                except Exception as e:
+                    logger.error(f"Error checking resolved markets: {e}")
+
             # Get prediction
             pred = get_current_prediction()
             prediction = pred.get("prediction", "hold")
 
             if prediction == "hold":
+                # Skip the cycle but don't update previous_prediction
+                # This way, "hold" states are transparent to flip detection
                 logger.info("Not enough data - skipping trade")
                 wait_with_check(bot_config.get("cycle_interval_seconds", 300))
                 continue
+
+            # Check for prediction flip and exit positions if needed
+            # Note: Because "hold" states are skipped above, previous_prediction
+            # always holds the last directional prediction ("up" or "down").
+            # Transitions like "up" → "hold" → "down" trigger exits when "down" arrives.
+            if not bot_config.get("dry_run", True):
+                if previous_prediction is not None and previous_prediction != prediction:
+                    logger.info(f"Prediction flipped: {previous_prediction} → {prediction}")
+                    try:
+                        check_prediction_flip_and_exit(prediction, send_notification)
+                    except Exception as e:
+                        logger.error(f"Error during prediction flip exit: {e}")
+
+            previous_prediction = prediction
 
             # Find markets
             markets = find_relevant_markets()
@@ -1251,8 +1685,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         ],
         [
             InlineKeyboardButton("📜 P&L", callback_data="pnl"),
-            InlineKeyboardButton("❓ Hilfe", callback_data="help"),
+            InlineKeyboardButton("📊 Positions", callback_data="positions"),
         ],
+        [InlineKeyboardButton("❓ Hilfe", callback_data="help")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -1300,6 +1735,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 /markets - Relevante Märkte finden
 /trade - Manueller Trade
 /bridge - Solana→Polygon Bridge
+
+**Position Tracking:**
+/positions - Offene Positionen anzeigen 📊
+  (Auto-Exit bei Prediction-Flip, Auto-P&L bei Resolution)
 
 **Configuration:**
 /config - Einstellungen anzeigen/ändern
@@ -1492,6 +1931,76 @@ async def pnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         text += f"{marker} {date}: {day_data.get('trades', 0)} trades, ${day_data.get('profit', 0):.2f}\n"
 
     text += f"\n**Recent Trades:** {len(pnl.get('trades', []))}"
+
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+async def positions_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /positions command - Show all open positions."""
+    if not is_authorized(update):
+        await unauthorized_response(update)
+        return
+
+    positions_data = load_positions()
+    open_positions = positions_data.get("open", [])
+    closed_positions = positions_data.get("closed", [])
+
+    if not open_positions:
+        # Show summary even if no open positions
+        total_closed = len(closed_positions)
+        total_pnl = sum(p.get("realized_pnl", 0) for p in closed_positions)
+        await update.message.reply_text(
+            f"📊 **Positions**\n\n"
+            f"No open positions.\n\n"
+            f"**History:**\n"
+            f"Closed positions: {total_closed}\n"
+            f"Total realized P&L: ${total_pnl:.2f}",
+            parse_mode="Markdown",
+        )
+        return
+
+    text = f"📊 **Open Positions ({len(open_positions)})**\n\n"
+
+    clob = _build_clob_client()
+
+    for i, pos in enumerate(open_positions, 1):
+        market_question = pos.get("market_question", "Unknown")[:40]
+        side = pos.get("side", "?").upper()
+        entry_price = pos.get("entry_price", 0)
+        amount = pos.get("amount", 0)
+        timestamp = parse_position_date(pos.get("timestamp", ""))
+
+        # Try to get current price for P&L calculation
+        current_price = entry_price
+        unrealized_pnl = 0.0
+        if clob:
+            try:
+                mid = clob.get_midpoint(pos.get("token_id", ""))
+                if mid:
+                    current_price = float(mid)
+                    shares = calculate_shares(amount, entry_price)
+                    unrealized_pnl = (current_price - entry_price) * shares
+            except Exception:
+                pass
+
+        text += f"**{i}. {side}** - {market_question}...\n"
+        text += f"   Entry: ${entry_price:.4f} | Current: ${current_price:.4f}\n"
+        text += f"   Amount: ${amount:.2f} | Unrealized P&L: ${unrealized_pnl:.2f}\n"
+        text += f"   Opened: {timestamp}\n\n"
+
+    # Add summary
+    total_invested = sum(p.get("amount", 0) for p in open_positions)
+    text += f"**Total Invested:** ${total_invested:.2f}\n"
+
+    # Recent closed positions
+    recent_closed = closed_positions[-3:] if closed_positions else []
+    if recent_closed:
+        text += f"\n**Recent Closed:**\n"
+        for pos in reversed(recent_closed):
+            side = pos.get("side", "?").upper()
+            pnl = pos.get("realized_pnl", 0)
+            emoji = "✅" if pnl >= 0 else "❌"
+            text += f"{emoji} {side}: ${pnl:.2f}\n"
 
     await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -2427,6 +2936,34 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         keyboard = [[InlineKeyboardButton("« Back", callback_data="back_main")]]
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
+    elif data == "positions":
+        positions_data = load_positions()
+        open_positions = positions_data.get("open", [])
+        closed_positions = positions_data.get("closed", [])
+
+        if not open_positions:
+            total_closed = len(closed_positions)
+            total_pnl = sum(p.get("realized_pnl", 0) for p in closed_positions)
+            text = (
+                f"📊 **Positions**\n\n"
+                f"No open positions.\n\n"
+                f"Closed: {total_closed}\n"
+                f"Total P&L: ${total_pnl:.2f}"
+            )
+        else:
+            text = f"📊 **Open Positions ({len(open_positions)})**\n\n"
+            for i, pos in enumerate(open_positions[:3], 1):
+                side = pos.get("side", "?").upper()
+                entry = pos.get("entry_price", 0)
+                amount = pos.get("amount", 0)
+                text += f"{i}. {side}: ${amount:.2f} @ {entry:.4f}\n"
+            if len(open_positions) > 3:
+                text += f"...and {len(open_positions) - 3} more\n"
+            text += f"\nUse /positions for details."
+
+        keyboard = [[InlineKeyboardButton("« Back", callback_data="back_main")]]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
     elif data == "help":
         text = "❓ **Help**\n\nUse /help for full command list."
 
@@ -2509,8 +3046,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             ],
             [
                 InlineKeyboardButton("📜 P&L", callback_data="pnl"),
-                InlineKeyboardButton("❓ Hilfe", callback_data="help"),
+                InlineKeyboardButton("📊 Positions", callback_data="positions"),
             ],
+            [InlineKeyboardButton("❓ Hilfe", callback_data="help")],
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -2612,6 +3150,7 @@ def main() -> None:
     application.add_handler(CommandHandler("predict", predict_command))
     application.add_handler(CommandHandler("markets", markets_command))
     application.add_handler(CommandHandler("pnl", pnl_command))
+    application.add_handler(CommandHandler("positions", positions_command))
     application.add_handler(CommandHandler("config", config_command))
     application.add_handler(CommandHandler("start_bot", start_bot_command))
     application.add_handler(CommandHandler("stop_bot", stop_bot_command))
