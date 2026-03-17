@@ -208,6 +208,12 @@ MAX_GAS_FEE_MULTIPLIER = 3
 MIN_SETTLEMENT_INTERVAL_MINUTES = 5
 MAX_SETTLEMENT_INTERVAL_MINUTES = 1440  # 24 hours
 
+# Dashboard Configuration
+DASHBOARD_SCALE_UP_WINRATE_THRESHOLD = 62.0  # Winrate % required to enable scale up
+MAX_PROFIT_FACTOR_CAP = 3.0  # Cap infinite profit factor at this value
+DEFAULT_AVG_WIN_PCT = 0.05  # Default 5% average win for projections
+DEFAULT_AVG_LOSS_PCT = 0.05  # Default 5% average loss for projections
+
 # Global state
 bot_config: dict = {}
 bot_thread: threading.Thread | None = None
@@ -478,14 +484,13 @@ def calculate_projected_monthly_return() -> dict:
         winrate = backtest.get("winrate", 50)
         profit_factor = backtest.get("profit_factor", 1.0)
         if isinstance(profit_factor, str) and profit_factor == "∞":
-            profit_factor = 3.0  # Cap infinity at 3x
+            profit_factor = MAX_PROFIT_FACTOR_CAP
         avg_trades_per_day = backtest.get("total_trades", 30) / 30  # 30-day backtest
     else:
         winrate = stats_7day["winrate"]
         total_7day = stats_7day["total_trades"]
         avg_trades_per_day = total_7day / 7 if total_7day > 0 else 1
         # Estimate profit factor from 7-day data
-        total_profit = abs(stats_7day["total_profit"])
         profit_factor = 1.2 if stats_7day["total_profit"] > 0 else 0.8
     
     # Calculate edge: (winrate/100 * avg_win) - (lossrate/100 * avg_loss)
@@ -494,9 +499,9 @@ def calculate_projected_monthly_return() -> dict:
     loss_prob = 1 - win_prob
     
     # Expected value per trade as percentage of trade amount
-    # Assuming symmetric wins/losses adjusted by profit factor
-    avg_win_pct = 0.05  # Assume 5% average win
-    avg_loss_pct = 0.05  # Assume 5% average loss
+    # Using configurable defaults for average win/loss percentages
+    avg_win_pct = DEFAULT_AVG_WIN_PCT
+    avg_loss_pct = DEFAULT_AVG_LOSS_PCT
     
     if profit_factor != float("inf") and profit_factor > 0:
         edge_per_trade = (win_prob * avg_win_pct) - (loss_prob * avg_loss_pct / profit_factor)
@@ -559,9 +564,8 @@ def get_next_trade_opportunities(count: int = 3) -> list[dict]:
             # Calculate expected value
             # EV = (probability of winning * potential profit) - (probability of losing * potential loss)
             # For mispriced markets, the edge is approximately the deviation percentage
-            fair_value = 1 - current_price if direction == "underpriced" else current_price
             
-            # Estimate win probability based on our edge
+            # Estimate win probability based on our edge (deviation from fair value)
             win_prob = min(0.5 + dev_pct / 200, 0.85)  # Cap at 85%
             
             # Expected value per $1 invested
@@ -598,6 +602,94 @@ def get_next_trade_opportunities(count: int = 3) -> list[dict]:
     except Exception as e:
         logger.error(f"Error getting trade opportunities: {e}")
         return []
+
+
+def build_dashboard_response() -> tuple[str, list]:
+    """Build the dashboard text and keyboard buttons.
+    
+    Returns:
+        Tuple of (text, keyboard_rows) for the dashboard display.
+    """
+    # Get current prediction/confidence
+    pred = get_current_prediction()
+    confidence = pred.get("confidence", 0)
+    direction = pred.get("prediction", "hold")
+    meets_threshold = pred.get("meets_threshold", False)
+    min_threshold = bot_config.get("min_confidence_threshold", 68)
+
+    # Get 7-day statistics
+    stats_7day = get_7day_stats()
+    winrate_7day = stats_7day["winrate"]
+
+    # Get projected monthly return
+    projection = calculate_projected_monthly_return()
+
+    # Get next trade opportunities
+    opportunities = get_next_trade_opportunities(count=3)
+
+    # Build dashboard text
+    confidence_emoji = "🟢" if confidence >= 70 else "🟡" if confidence >= 50 else "🔴"
+    direction_emoji = "📈" if direction == "up" else "📉" if direction == "down" else "⏸️"
+    
+    text = f"""
+💎 **MONEY BOT DASHBOARD** 💎
+
+━━━━━━━━━━━━━━━━━━━━━━
+🎯 **Live Confidence Score**
+{confidence_emoji} **{confidence:.1f}%** {direction_emoji} {direction.upper()}
+Threshold: {min_threshold}% | Status: {'✅ TRADING' if meets_threshold else '⏸️ WAITING'}
+
+━━━━━━━━━━━━━━━━━━━━━━
+📊 **7-Day Performance**
+Trades: {stats_7day['total_trades']} | Wins: {stats_7day['winning_trades']} | Losses: {stats_7day['losing_trades']}
+Winrate: **{winrate_7day:.1f}%** {'🔥' if winrate_7day > DASHBOARD_SCALE_UP_WINRATE_THRESHOLD else ''}
+Total P&L: **${stats_7day['total_profit']:.2f}**
+
+━━━━━━━━━━━━━━━━━━━━━━
+💰 **Projected Monthly Return**
+Edge per trade: **{projection['edge']:.2f}%**
+Trades/day: ~{projection['avg_trades_per_day']:.1f}
+Monthly trades: ~{int(projection['trades_per_month'])}
+**Projected: ${projection['projected_return_usd']:.2f}** ({projection['projected_return_pct']:.1f}%)
+Confidence: {projection['confidence_level']}
+
+━━━━━━━━━━━━━━━━━━━━━━
+🎲 **Next 3 Trade Opportunities**
+"""
+
+    if opportunities:
+        for i, opp in enumerate(opportunities, 1):
+            ev_emoji = "✅" if opp["expected_value"] > 0 else "⚠️"
+            text += f"""
+**{i}. {opp['question']}...**
+   💵 EV: {ev_emoji}${opp['expected_value']:.2f} | Win: {opp['win_probability']:.0f}%
+   📍 Deviation: {opp['deviation_pct']:.1f}% {opp['direction']}
+   👉 Rec: Buy **{opp['recommended_side']}** at ${opp['current_price']:.2f}
+"""
+    else:
+        text += "\n_No high-confidence opportunities found._\n"
+
+    text += f"""
+━━━━━━━━━━━━━━━━━━━━━━
+⚙️ **Current Settings**
+Trade Amount: **${bot_config.get('trade_amount', 5.0):.2f}**
+"""
+
+    # Add scale up button if winrate is good
+    keyboard = []
+    if winrate_7day > DASHBOARD_SCALE_UP_WINRATE_THRESHOLD:
+        keyboard.append([
+            InlineKeyboardButton("🚀 Scale Up 2x", callback_data="scale_up_2x"),
+        ])
+        text += f"🚀 _Winrate {winrate_7day:.1f}% > {DASHBOARD_SCALE_UP_WINRATE_THRESHOLD}% - Scale up available!_\n"
+    else:
+        text += f"⏳ _Winrate {winrate_7day:.1f}% < {DASHBOARD_SCALE_UP_WINRATE_THRESHOLD}% - Scale up locked_\n"
+
+    keyboard.append([InlineKeyboardButton("🔄 Refresh", callback_data="refresh_dashboard")])
+    keyboard.append([InlineKeyboardButton("📈 View Chart", callback_data="view_chart")])
+    keyboard.append([InlineKeyboardButton("« Back to Menu", callback_data="back_main")])
+    
+    return text, keyboard
 
 
 def load_positions() -> dict:
@@ -4288,7 +4380,7 @@ async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     - Next 3 trades with expected value
     - 7-day profit graph (as image)
     - Projected monthly return at current edge
-    - Scale up 2x button if winrate > 62%
+    - Scale up 2x button if winrate > threshold
     """
     if not is_authorized(update):
         await unauthorized_response(update)
@@ -4296,84 +4388,8 @@ async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     await update.message.reply_text("📊 Loading dashboard...")
 
-    # Get current prediction/confidence
-    pred = get_current_prediction()
-    confidence = pred.get("confidence", 0)
-    direction = pred.get("prediction", "hold")
-    meets_threshold = pred.get("meets_threshold", False)
-    min_threshold = bot_config.get("min_confidence_threshold", 68)
-
-    # Get 7-day statistics
-    stats_7day = get_7day_stats()
-    winrate_7day = stats_7day["winrate"]
-
-    # Get projected monthly return
-    projection = calculate_projected_monthly_return()
-
-    # Get next trade opportunities
-    opportunities = get_next_trade_opportunities(count=3)
-
-    # Build dashboard text
-    confidence_emoji = "🟢" if confidence >= 70 else "🟡" if confidence >= 50 else "🔴"
-    direction_emoji = "📈" if direction == "up" else "📉" if direction == "down" else "⏸️"
-    
-    text = f"""
-💎 **MONEY BOT DASHBOARD** 💎
-
-━━━━━━━━━━━━━━━━━━━━━━
-🎯 **Live Confidence Score**
-{confidence_emoji} **{confidence:.1f}%** {direction_emoji} {direction.upper()}
-Threshold: {min_threshold}% | Status: {'✅ TRADING' if meets_threshold else '⏸️ WAITING'}
-
-━━━━━━━━━━━━━━━━━━━━━━
-📊 **7-Day Performance**
-Trades: {stats_7day['total_trades']} | Wins: {stats_7day['winning_trades']} | Losses: {stats_7day['losing_trades']}
-Winrate: **{winrate_7day:.1f}%** {'🔥' if winrate_7day > 62 else ''}
-Total P&L: **${stats_7day['total_profit']:.2f}**
-
-━━━━━━━━━━━━━━━━━━━━━━
-💰 **Projected Monthly Return**
-Edge per trade: **{projection['edge']:.2f}%**
-Trades/day: ~{projection['avg_trades_per_day']:.1f}
-Monthly trades: ~{int(projection['trades_per_month'])}
-**Projected: ${projection['projected_return_usd']:.2f}** ({projection['projected_return_pct']:.1f}%)
-Confidence: {projection['confidence_level']}
-
-━━━━━━━━━━━━━━━━━━━━━━
-🎲 **Next 3 Trade Opportunities**
-"""
-
-    if opportunities:
-        for i, opp in enumerate(opportunities, 1):
-            ev_emoji = "✅" if opp["expected_value"] > 0 else "⚠️"
-            text += f"""
-**{i}. {opp['question']}...**
-   💵 EV: {ev_emoji}${opp['expected_value']:.2f} | Win: {opp['win_probability']:.0f}%
-   📍 Deviation: {opp['deviation_pct']:.1f}% {opp['direction']}
-   👉 Rec: Buy **{opp['recommended_side']}** at ${opp['current_price']:.2f}
-"""
-    else:
-        text += "\n_No high-confidence opportunities found._\n"
-
-    text += f"""
-━━━━━━━━━━━━━━━━━━━━━━
-⚙️ **Current Settings**
-Trade Amount: **${bot_config.get('trade_amount', 5.0):.2f}**
-"""
-
-    # Add scale up button if winrate is good
-    keyboard = []
-    if winrate_7day > 62:
-        keyboard.append([
-            InlineKeyboardButton("🚀 Scale Up 2x", callback_data="scale_up_2x"),
-        ])
-        text += f"🚀 _Winrate {winrate_7day:.1f}% > 62% - Scale up available!_\n"
-    else:
-        text += f"⏳ _Winrate {winrate_7day:.1f}% < 62% - Scale up locked_\n"
-
-    keyboard.append([InlineKeyboardButton("🔄 Refresh", callback_data="refresh_dashboard")])
-    keyboard.append([InlineKeyboardButton("« Back to Menu", callback_data="back_main")])
-    
+    # Build dashboard using helper function
+    text, keyboard = build_dashboard_response()
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     await update.message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
@@ -6538,88 +6554,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
     elif data == "open_dashboard":
-        # Open dashboard via button (same as refresh_dashboard)
+        # Open dashboard via button
         await query.edit_message_text("📊 Loading dashboard...")
         
-        # Get current prediction/confidence
-        pred = get_current_prediction()
-        confidence = pred.get("confidence", 0)
-        direction = pred.get("prediction", "hold")
-        meets_threshold = pred.get("meets_threshold", False)
-        min_threshold = bot_config.get("min_confidence_threshold", 68)
-
-        # Get 7-day statistics
-        stats_7day = get_7day_stats()
-        winrate_7day = stats_7day["winrate"]
-
-        # Get projected monthly return
-        projection = calculate_projected_monthly_return()
-
-        # Get next trade opportunities
-        opportunities = get_next_trade_opportunities(count=3)
-
-        # Build dashboard text
-        confidence_emoji = "🟢" if confidence >= 70 else "🟡" if confidence >= 50 else "🔴"
-        direction_emoji = "📈" if direction == "up" else "📉" if direction == "down" else "⏸️"
-        
-        text = f"""
-💎 **MONEY BOT DASHBOARD** 💎
-
-━━━━━━━━━━━━━━━━━━━━━━
-🎯 **Live Confidence Score**
-{confidence_emoji} **{confidence:.1f}%** {direction_emoji} {direction.upper()}
-Threshold: {min_threshold}% | Status: {'✅ TRADING' if meets_threshold else '⏸️ WAITING'}
-
-━━━━━━━━━━━━━━━━━━━━━━
-📊 **7-Day Performance**
-Trades: {stats_7day['total_trades']} | Wins: {stats_7day['winning_trades']} | Losses: {stats_7day['losing_trades']}
-Winrate: **{winrate_7day:.1f}%** {'🔥' if winrate_7day > 62 else ''}
-Total P&L: **${stats_7day['total_profit']:.2f}**
-
-━━━━━━━━━━━━━━━━━━━━━━
-💰 **Projected Monthly Return**
-Edge per trade: **{projection['edge']:.2f}%**
-Trades/day: ~{projection['avg_trades_per_day']:.1f}
-Monthly trades: ~{int(projection['trades_per_month'])}
-**Projected: ${projection['projected_return_usd']:.2f}** ({projection['projected_return_pct']:.1f}%)
-Confidence: {projection['confidence_level']}
-
-━━━━━━━━━━━━━━━━━━━━━━
-🎲 **Next 3 Trade Opportunities**
-"""
-
-        if opportunities:
-            for i, opp in enumerate(opportunities, 1):
-                ev_emoji = "✅" if opp["expected_value"] > 0 else "⚠️"
-                text += f"""
-**{i}. {opp['question']}...**
-   💵 EV: {ev_emoji}${opp['expected_value']:.2f} | Win: {opp['win_probability']:.0f}%
-   📍 Deviation: {opp['deviation_pct']:.1f}% {opp['direction']}
-   👉 Rec: Buy **{opp['recommended_side']}** at ${opp['current_price']:.2f}
-"""
-        else:
-            text += "\n_No high-confidence opportunities found._\n"
-
-        text += f"""
-━━━━━━━━━━━━━━━━━━━━━━
-⚙️ **Current Settings**
-Trade Amount: **${bot_config.get('trade_amount', 5.0):.2f}**
-"""
-
-        # Add scale up button if winrate is good
-        keyboard = []
-        if winrate_7day > 62:
-            keyboard.append([
-                InlineKeyboardButton("🚀 Scale Up 2x", callback_data="scale_up_2x"),
-            ])
-            text += f"🚀 _Winrate {winrate_7day:.1f}% > 62% - Scale up available!_\n"
-        else:
-            text += f"⏳ _Winrate {winrate_7day:.1f}% < 62% - Scale up locked_\n"
-
-        keyboard.append([InlineKeyboardButton("🔄 Refresh", callback_data="refresh_dashboard")])
-        keyboard.append([InlineKeyboardButton("📈 View Chart", callback_data="view_chart")])
-        keyboard.append([InlineKeyboardButton("« Back to Menu", callback_data="back_main")])
-        
+        # Build dashboard using helper function
+        text, keyboard = build_dashboard_response()
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(text, reply_markup=reply_markup, parse_mode="Markdown")
 
@@ -6641,11 +6580,11 @@ Trade Amount: **${bot_config.get('trade_amount', 5.0):.2f}**
             await query.answer("Error generating chart", show_alert=True)
 
     elif data == "scale_up_2x":
-        # Scale up trade amount 2x if winrate > 62%
+        # Scale up trade amount 2x if winrate > threshold
         stats_7day = get_7day_stats()
         winrate_7day = stats_7day["winrate"]
         
-        if winrate_7day > 62:
+        if winrate_7day > DASHBOARD_SCALE_UP_WINRATE_THRESHOLD:
             current_amount = bot_config.get("trade_amount", 5.0)
             new_amount = current_amount * 2
             bot_config["trade_amount"] = new_amount
@@ -6666,7 +6605,7 @@ Trade Amount: **${bot_config.get('trade_amount', 5.0):.2f}**
             text = (
                 f"⛔ **Scale Up Denied**\n\n"
                 f"7-Day Winrate: **{winrate_7day:.1f}%**\n"
-                f"Required: **>62%**\n\n"
+                f"Required: **>{DASHBOARD_SCALE_UP_WINRATE_THRESHOLD}%**\n\n"
                 f"_Keep trading to improve your winrate!_"
             )
             keyboard = [
@@ -6677,87 +6616,10 @@ Trade Amount: **${bot_config.get('trade_amount', 5.0):.2f}**
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
     elif data == "refresh_dashboard":
-        # Refresh dashboard inline
+        # Refresh dashboard using helper function
         await query.edit_message_text("📊 Refreshing dashboard...")
         
-        # Get current prediction/confidence
-        pred = get_current_prediction()
-        confidence = pred.get("confidence", 0)
-        direction = pred.get("prediction", "hold")
-        meets_threshold = pred.get("meets_threshold", False)
-        min_threshold = bot_config.get("min_confidence_threshold", 68)
-
-        # Get 7-day statistics
-        stats_7day = get_7day_stats()
-        winrate_7day = stats_7day["winrate"]
-
-        # Get projected monthly return
-        projection = calculate_projected_monthly_return()
-
-        # Get next trade opportunities
-        opportunities = get_next_trade_opportunities(count=3)
-
-        # Build dashboard text
-        confidence_emoji = "🟢" if confidence >= 70 else "🟡" if confidence >= 50 else "🔴"
-        direction_emoji = "📈" if direction == "up" else "📉" if direction == "down" else "⏸️"
-        
-        text = f"""
-💎 **MONEY BOT DASHBOARD** 💎
-
-━━━━━━━━━━━━━━━━━━━━━━
-🎯 **Live Confidence Score**
-{confidence_emoji} **{confidence:.1f}%** {direction_emoji} {direction.upper()}
-Threshold: {min_threshold}% | Status: {'✅ TRADING' if meets_threshold else '⏸️ WAITING'}
-
-━━━━━━━━━━━━━━━━━━━━━━
-📊 **7-Day Performance**
-Trades: {stats_7day['total_trades']} | Wins: {stats_7day['winning_trades']} | Losses: {stats_7day['losing_trades']}
-Winrate: **{winrate_7day:.1f}%** {'🔥' if winrate_7day > 62 else ''}
-Total P&L: **${stats_7day['total_profit']:.2f}**
-
-━━━━━━━━━━━━━━━━━━━━━━
-💰 **Projected Monthly Return**
-Edge per trade: **{projection['edge']:.2f}%**
-Trades/day: ~{projection['avg_trades_per_day']:.1f}
-Monthly trades: ~{int(projection['trades_per_month'])}
-**Projected: ${projection['projected_return_usd']:.2f}** ({projection['projected_return_pct']:.1f}%)
-Confidence: {projection['confidence_level']}
-
-━━━━━━━━━━━━━━━━━━━━━━
-🎲 **Next 3 Trade Opportunities**
-"""
-
-        if opportunities:
-            for i, opp in enumerate(opportunities, 1):
-                ev_emoji = "✅" if opp["expected_value"] > 0 else "⚠️"
-                text += f"""
-**{i}. {opp['question']}...**
-   💵 EV: {ev_emoji}${opp['expected_value']:.2f} | Win: {opp['win_probability']:.0f}%
-   📍 Deviation: {opp['deviation_pct']:.1f}% {opp['direction']}
-   👉 Rec: Buy **{opp['recommended_side']}** at ${opp['current_price']:.2f}
-"""
-        else:
-            text += "\n_No high-confidence opportunities found._\n"
-
-        text += f"""
-━━━━━━━━━━━━━━━━━━━━━━
-⚙️ **Current Settings**
-Trade Amount: **${bot_config.get('trade_amount', 5.0):.2f}**
-"""
-
-        # Add scale up button if winrate is good
-        keyboard = []
-        if winrate_7day > 62:
-            keyboard.append([
-                InlineKeyboardButton("🚀 Scale Up 2x", callback_data="scale_up_2x"),
-            ])
-            text += f"🚀 _Winrate {winrate_7day:.1f}% > 62% - Scale up available!_\n"
-        else:
-            text += f"⏳ _Winrate {winrate_7day:.1f}% < 62% - Scale up locked_\n"
-
-        keyboard.append([InlineKeyboardButton("🔄 Refresh", callback_data="refresh_dashboard")])
-        keyboard.append([InlineKeyboardButton("« Back to Menu", callback_data="back_main")])
-        
+        text, keyboard = build_dashboard_response()
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(text, reply_markup=reply_markup, parse_mode="Markdown")
 
