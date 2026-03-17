@@ -1,3 +1,8 @@
 pycoingecko>=3.1.0
 requests>=2.28.0
 py-clob-client>=0.18.0
+solana>=0.34.0
+solders
+base58
+eth-account>=0.8.0
+spl-token>=0.3.0
