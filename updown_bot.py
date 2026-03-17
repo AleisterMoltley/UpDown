@@ -35,6 +35,9 @@ import time
 import requests
 from pycoingecko import CoinGeckoAPI
 
+# Import market scanner module for Scanner-First logic
+from market_scanner import get_top_mispriced_markets
+
 # ---------------------------------------------------------------------------
 # Configuration – loaded from environment variables so secrets are never
 # hard-coded in source.
@@ -911,25 +914,26 @@ def run_bot(
     trade_amount: float = 5.0,
     dry_run: bool = False,
 ) -> None:
-    """Run the prediction and (optionally) trading loop.
+    """Run the prediction and (optionally) trading loop using Scanner-First logic.
+
+    Scanner-First Logic:
+    1. Call get_top_mispriced_markets(count=8, min_deviation_pct=12, prioritize_politics=True)
+    2. For each market, calculate signal confidence and filter where signal direction matches deviation direction
+    3. Select top-1 with highest (deviation_pct * confidence)
+    4. Trade only when combined_score > 75
 
     Args:
         crypto_id: CoinGecko asset ID (e.g. ``'bitcoin'``).
-        query_terms: Terms used to filter Polymarket markets.
+        query_terms: Deprecated - kept for backward compatibility but not used in Scanner-First mode.
         trade_amount: USDC amount per trade.
         dry_run: When *True*, market data and predictions are logged but no
                  orders are submitted.
     """
     clob = None if dry_run else _build_clob_client()
 
-    if query_terms is None:
-        from datetime import datetime, timezone  # noqa: PLC0415
-        today = datetime.now(timezone.utc).strftime("%B %d").lstrip("0").lower()
-        query_terms = ["btc", today]
-
     print("UpDown bot started.")
+    print("  Scanner Mode active – searching mispriced")
     print(f"  Asset         : {crypto_id}")
-    print(f"  Query terms   : {query_terms}")
     print(f"  Trade amount  : ${trade_amount} USDC")
     print(f"  Dry run       : {dry_run}")
     print(f"  Cycle         : {CYCLE_INTERVAL}s")
@@ -944,12 +948,12 @@ def run_bot(
 
     while True:
         print("=" * 60)
-        print("Running bot cycle…")
+        print("Running bot cycle (Scanner-First mode)…")
 
         # Step 0 – Check and fund Polygon balance if needed (Solana auto-funding)
         check_and_fund_polygon(clob, dry_run=dry_run)
 
-        # Step 1 – Fetch OHLC data.
+        # Step 1 – Fetch OHLC data for signal calculation
         try:
             ohlc = fetch_5min_data(crypto_id=crypto_id)
         except Exception as exc:  # noqa: BLE001
@@ -960,46 +964,131 @@ def run_bot(
         closes = [candle[4] for candle in ohlc]
         print(f"Fetched {len(closes)} candles. Latest close: {closes[-1] if closes else 'n/a'}")
 
-        # Step 2 – Predict direction with confidence.
-        prediction_result = predict_up_down(closes)
-        prediction = prediction_result["direction"]
-        confidence = prediction_result["confidence"]
-        print(f"Prediction for next period: {prediction.upper()} (confidence: {confidence:.1f}%)")
+        # Step 2 – Scanner-First: Get top mispriced markets
+        print("Scanner Mode active – searching mispriced")
+        try:
+            mispriced_markets = get_top_mispriced_markets(
+                count=8,
+                min_deviation_pct=12,
+                prioritize_politics=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"Error fetching mispriced markets: {exc}")
+            time.sleep(CYCLE_INTERVAL)
+            continue
 
-        if prediction == "hold":
+        if not mispriced_markets:
+            print("No mispriced markets found.")
+            time.sleep(CYCLE_INTERVAL)
+            continue
+
+        print(f"Found {len(mispriced_markets)} mispriced market(s).")
+
+        # Step 3 – Calculate signal direction using MA crossover
+        prediction_result = predict_up_down(closes)
+        signal_direction = prediction_result["direction"]
+        base_confidence = prediction_result["confidence"]
+        print(f"Base signal: {signal_direction.upper()} (confidence: {base_confidence:.1f}%)")
+
+        if signal_direction == "hold":
             print("Not enough data – skipping trade.")
             time.sleep(CYCLE_INTERVAL)
             continue
 
-        # Step 3 – Discover markets.
-        markets = find_relevant_markets(query_terms)
-        if not markets:
-            print("No relevant markets found.")
-        else:
-            print(f"Found {len(markets)} relevant market(s).")
-            for market in markets:
-                print(f"  Market: {market.get('question')} (ID: {market.get('id')})")
-
-                # Step 4 – Calculate Kelly-optimized position size and execute trade.
-                current_balance = get_polygon_balance(clob)
-                kelly_result = calc_kelly_size(
-                    confidence=confidence,
-                    balance=current_balance,
-                    base_trade_amount=trade_amount,
+        # Step 4 – Filter markets where signal direction matches deviation direction
+        # and calculate combined_score = deviation_pct * confidence
+        candidates = []
+        for market in mispriced_markets:
+            price_deviation = market.get("price_deviation", {})
+            deviation_pct = abs(price_deviation.get("deviation_pct", 0))
+            deviation_direction = price_deviation.get("direction", "unknown")
+            
+            # Map deviation direction to expected signal direction:
+            # - "underpriced" means price is below historical mean → expect price to go UP → signal should be "up"
+            # - "overpriced" means price is above historical mean → expect price to go DOWN → signal should be "down"
+            expected_signal_direction = "up" if deviation_direction == "underpriced" else "down"
+            
+            # Only include markets where signal direction matches expected direction from deviation
+            if signal_direction == expected_signal_direction:
+                # Calculate combined_score = deviation_pct * confidence
+                combined_score = deviation_pct * base_confidence
+                candidates.append({
+                    "market": market,
+                    "deviation_pct": deviation_pct,
+                    "deviation_direction": deviation_direction,
+                    "signal_direction": signal_direction,
+                    "confidence": base_confidence,
+                    "combined_score": combined_score,
+                })
+                print(
+                    f"  ✓ Market: {market.get('question', 'N/A')[:50]}... "
+                    f"(deviation: {deviation_pct:.1f}%, combined_score: {combined_score:.1f})"
                 )
-                kelly_size = kelly_result["size"]
-                kelly_edge = kelly_result["edge"]
-                
-                if dry_run:
-                    print(
-                        f"  [Dry run] Would buy {'YES' if prediction == 'up' else 'NO'} "
-                        f"for ${kelly_size:.2f} USDC. Kelly bet size: ${kelly_size:.2f} (edge {kelly_edge:.2f}%)"
-                    )
-                else:
-                    outcome = "yes" if prediction == "up" else "no"
-                    place_trade(clob, market, outcome=outcome, amount=kelly_size)
+            else:
+                print(
+                    f"  ✗ Market: {market.get('question', 'N/A')[:50]}... "
+                    f"SKIPPED: Signal ({signal_direction}) != expected ({expected_signal_direction})"
+                )
 
-        print(f"Sleeping {CYCLE_INTERVAL}s until next cycle…\n")
+        if not candidates:
+            print("No markets with matching signal/deviation direction found.")
+            time.sleep(CYCLE_INTERVAL)
+            continue
+
+        # Step 5 – Select top-1 with highest combined_score
+        candidates.sort(key=lambda x: x["combined_score"], reverse=True)
+        best_candidate = candidates[0]
+        
+        market = best_candidate["market"]
+        deviation_pct = best_candidate["deviation_pct"]
+        deviation_direction = best_candidate["deviation_direction"]
+        confidence = best_candidate["confidence"]
+        combined_score = best_candidate["combined_score"]
+
+        print(
+            f"\nSelected best market: {market.get('question', 'N/A')[:60]}..."
+            f"\n  Combined Score: {combined_score:.1f}"
+        )
+
+        # Step 6 – Trade only when combined_score > 75
+        if combined_score <= 75:
+            print(f"Combined score {combined_score:.1f} <= 75 – skipping trade.")
+            time.sleep(CYCLE_INTERVAL)
+            continue
+
+        # Get market details
+        price_deviation = market.get("price_deviation", {})
+        current_price = price_deviation.get("current_price", 0.5)
+        historical_mean = price_deviation.get("historical_mean", 0.5)
+        category = market.get("category", "other")
+
+        print(f"  Category: {category}")
+        print(f"  Signal: {signal_direction.upper()}")
+        print(f"  Deviation: {deviation_pct:.1f}% ({deviation_direction})")
+        print(f"  Confidence: {confidence:.1f}%")
+        print(f"  Current Price: {current_price:.2%}")
+        print(f"  Historical Mean: {historical_mean:.2%}")
+
+        # Calculate Kelly-optimized position size and execute trade
+        current_balance = get_polygon_balance(clob)
+        kelly_result = calc_kelly_size(
+            confidence=confidence,
+            balance=current_balance,
+            base_trade_amount=trade_amount,
+        )
+        kelly_size = kelly_result["size"]
+        kelly_edge = kelly_result["edge"]
+        
+        if dry_run:
+            print(
+                f"  [Dry run] Would buy {'YES' if signal_direction == 'up' else 'NO'} "
+                f"for ${kelly_size:.2f} USDC (edge {kelly_edge:.2f}%)"
+            )
+        else:
+            outcome = "yes" if signal_direction == "up" else "no"
+            place_trade(clob, market, outcome=outcome, amount=kelly_size)
+
+        print(f"\nSleeping {CYCLE_INTERVAL}s until next cycle…\n")
         time.sleep(CYCLE_INTERVAL)
 
 
