@@ -187,6 +187,19 @@ WMATIC_ADDRESS = "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270"
 # Max uint256 für Approvals
 MAX_UINT256 = 2**256 - 1
 
+# Emergency Fund Settings
+# Null/Burn Address für Validierung
+NULL_ADDRESS = "0x0000000000000000000000000000000000000000"
+# Meds-Wallet Adresse für /emergency_fund Command (Placeholder - später setzen)
+MEDS_WALLET_ADDRESS = "0x0000000000000000000000000000000000000000"  # TODO: Set actual address
+# Auto MATIC Top-Up Threshold
+AUTO_MATIC_MIN_THRESHOLD = 0.15  # MATIC minimum before auto top-up
+AUTO_MATIC_TOPUP_SWAP_AMOUNT = 0.25  # USDC to swap to MATIC
+# Minimum Transfer Amount for emergency fund
+MIN_EMERGENCY_FUND_TRANSFER = 0.01  # Minimum USDC amount for transfer
+# Maximum gas fee multiplier (to avoid excessive fees during congestion)
+MAX_GAS_FEE_MULTIPLIER = 3
+
 # Settlement interval limits (in minutes)
 MIN_SETTLEMENT_INTERVAL_MINUTES = 5
 MAX_SETTLEMENT_INTERVAL_MINUTES = 1440  # 24 hours
@@ -277,6 +290,20 @@ def save_pnl(pnl_data: dict) -> None:
             json.dump(pnl_data, f, indent=2)
     except OSError as e:
         logger.error(f"Could not save P&L: {e}")
+
+
+def was_last_trade_profitable() -> bool:
+    """Check if the last recorded trade was profitable.
+    
+    Returns:
+        True if last trade had profit > 0, False otherwise or if no trades.
+    """
+    pnl = load_pnl()
+    trades = pnl.get("trades", [])
+    if not trades:
+        return False
+    last_trade = trades[-1]
+    return last_trade.get("profit", 0.0) > 0
 
 
 # ---------------------------------------------------------------------------
@@ -1128,6 +1155,96 @@ def swap_usdc_to_matic(amount_usdc: float) -> dict:
         
     except Exception as e:
         logger.error(f"Fehler beim USDC → MATIC Swap: {e}")
+        return {"success": False, "error": str(e)}
+
+
+def transfer_usdc(to_address: str, amount_usdc: float) -> dict:
+    """Transfer USDC to another address on Polygon.
+    
+    Args:
+        to_address: Recipient wallet address (0x format)
+        amount_usdc: Amount in USDC to transfer
+    
+    Returns:
+        Dict mit 'success', 'tx', und eventuell 'error'.
+    """
+    try:
+        w3 = get_web3_client()
+        if w3 is None:
+            return {"success": False, "error": "Web3 nicht verfügbar"}
+        
+        key = bot_config.get("polygon_private_key", "")
+        if not key:
+            return {"success": False, "error": "Kein Polygon Private Key konfiguriert"}
+        
+        from eth_account import Account
+        key_with_prefix = key if key.startswith("0x") else f"0x{key}"
+        account = Account.from_key(key_with_prefix)
+        address = account.address
+        
+        # Validiere Empfängeradresse
+        if not w3.is_address(to_address):
+            return {"success": False, "error": f"Ungültige Empfängeradresse: {to_address}"}
+        
+        # Check MATIC balance für Gas
+        matic_balance = get_matic_balance()
+        if matic_balance < 0.01:
+            return {"success": False, "error": f"Nicht genug MATIC für Gas! Balance: {matic_balance:.4f} MATIC"}
+        
+        # 30 Sekunden Safety-Delay
+        logger.info(f"⚠️ USDC Transfer: {amount_usdc} USDC → {to_address}. 30s Safety-Delay...")
+        time.sleep(30)
+        
+        # ERC20 Transfer ABI
+        erc20_transfer_abi = [
+            {
+                "constant": False,
+                "inputs": [
+                    {"name": "to", "type": "address"},
+                    {"name": "amount", "type": "uint256"}
+                ],
+                "name": "transfer",
+                "outputs": [{"name": "", "type": "bool"}],
+                "type": "function"
+            }
+        ]
+        
+        usdc_contract = w3.eth.contract(
+            address=w3.to_checksum_address(POLYGON_USDC_ADDRESS),
+            abi=erc20_transfer_abi
+        )
+        
+        # Amount in USDC wei (6 decimals)
+        amount_wei = int(amount_usdc * 10**6)
+        
+        nonce = w3.eth.get_transaction_count(address)
+        chain_id = bot_config.get("chain_id", 137)
+        
+        # Calculate gas fee with cap to avoid excessive fees during congestion
+        base_gas_price = w3.eth.gas_price
+        max_fee = min(base_gas_price * 2, w3.to_wei(500, "gwei"))  # Cap at 500 gwei
+        
+        tx = usdc_contract.functions.transfer(
+            w3.to_checksum_address(to_address),
+            amount_wei
+        ).build_transaction({
+            "from": address,
+            "nonce": nonce,
+            "gas": 100000,
+            "maxFeePerGas": max_fee,
+            "maxPriorityFeePerGas": w3.to_wei(30, "gwei"),
+            "chainId": chain_id,
+        })
+        
+        signed_tx = account.sign_transaction(tx)
+        tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+        
+        logger.info(f"USDC Transfer Tx: {tx_hash.hex()}")
+        
+        return {"success": True, "tx": tx_hash.hex(), "amount": amount_usdc, "to": to_address}
+        
+    except Exception as e:
+        logger.error(f"Fehler beim USDC Transfer: {e}")
         return {"success": False, "error": str(e)}
 
 
@@ -3231,33 +3348,73 @@ def send_to_polymarket_bridge(deposit_address: str, amount_usdc: float) -> dict:
 
 
 def check_and_fund_polygon() -> dict:
-    """Check Polygon balance and trigger bridge funding if below threshold."""
+    """Check Polygon balance and trigger bridge funding if below threshold.
+    
+    Also checks MATIC balance and auto top-ups if:
+    - MATIC < 0.15 AND last trade was profitable
+    """
+    result = {"funded": False, "matic_topped_up": False}
+    
     if bot_config.get("dry_run", True):
-        return {"funded": False, "reason": "dry_run"}
+        result["reason"] = "dry_run"
+        return result
+
+    # Check MATIC balance and auto top-up if needed
+    # Condition: MATIC < 0.15 AND last trade was profitable
+    try:
+        matic_balance = get_matic_balance()
+        if (
+            matic_balance < AUTO_MATIC_MIN_THRESHOLD
+            and was_last_trade_profitable()
+            and bot_config.get("auto_matic_topup_enabled", True)
+        ):
+            logger.info(
+                f"Auto MATIC Top-Up triggered: MATIC={matic_balance:.4f} < {AUTO_MATIC_MIN_THRESHOLD}, "
+                f"last trade profitable"
+            )
+            swap_result = swap_usdc_to_matic(AUTO_MATIC_TOPUP_SWAP_AMOUNT)
+            if swap_result.get("success"):
+                result["matic_topped_up"] = True
+                result["matic_topup_tx"] = swap_result.get("tx")
+                logger.info(f"Auto MATIC Top-Up erfolgreich: {AUTO_MATIC_TOPUP_SWAP_AMOUNT} USDC → MATIC")
+            else:
+                logger.warning(f"Auto MATIC Top-Up fehlgeschlagen: {swap_result.get('error')}")
+    except Exception as e:
+        logger.warning(f"Auto MATIC Top-Up check Fehler: {e}")
 
     if not bot_config.get("solana_private_key"):
-        return {"funded": False, "reason": "solana_not_configured"}
+        result["reason"] = "solana_not_configured"
+        return result
 
     current_balance = get_polygon_balance()
     min_balance = bot_config.get("min_poly_balance_usdc", 20.0)
 
     if current_balance >= min_balance:
-        return {"funded": False, "reason": "balance_ok", "balance": current_balance}
+        result["reason"] = "balance_ok"
+        result["balance"] = current_balance
+        return result
 
     polygon_address = get_polygon_address()
     if not polygon_address:
-        return {"funded": False, "reason": "polygon_address_error"}
+        result["reason"] = "polygon_address_error"
+        return result
 
     deposit_address = get_solana_deposit_address(polygon_address)
     if not deposit_address:
-        return {"funded": False, "reason": "deposit_address_error"}
+        result["reason"] = "deposit_address_error"
+        return result
 
     bridge_amount = bot_config.get("bridge_fund_amount", 50.0)
-    result = send_to_polymarket_bridge(deposit_address, bridge_amount)
+    bridge_result = send_to_polymarket_bridge(deposit_address, bridge_amount)
 
-    if result.get("success"):
-        return {"funded": True, "amount": bridge_amount, "tx": result.get("tx")}
-    return {"funded": False, "reason": result.get("error")}
+    if bridge_result.get("success"):
+        result["funded"] = True
+        result["amount"] = bridge_amount
+        result["tx"] = bridge_result.get("tx")
+        return result
+    
+    result["reason"] = bridge_result.get("error")
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -3283,6 +3440,13 @@ def bot_loop(send_notification):
                     f"🌉 **Auto-funded Polygon**\n"
                     f"Amount: ${fund_result.get('amount', 0):.2f}\n"
                     f"Tx: `{fund_result.get('tx', 'N/A')}`"
+                )
+            if fund_result.get("matic_topped_up"):
+                send_notification(
+                    f"⛽ **Auto MATIC Top-Up**\n"
+                    f"Swapped: ${AUTO_MATIC_TOPUP_SWAP_AMOUNT:.2f} USDC → MATIC\n"
+                    f"Reason: MATIC < {AUTO_MATIC_MIN_THRESHOLD} & letzter Trade profitabel\n"
+                    f"Tx: `{fund_result.get('matic_topup_tx', 'N/A')}`"
                 )
 
             # Automatic position settlement tracking (every 30 minutes by default)
@@ -3572,6 +3736,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 **Onchain Setup (NEU):**
 /setup_approvals - USDC/CTF Approvals setzen ⛓️
 /gas_status - MATIC-Balance anzeigen ⛽
+/emergency_fund - 10% Balance → Meds-Wallet 🚨
 
 **Trading:**
 /balance - Alle Balances anzeigen
@@ -5144,6 +5309,104 @@ Betrag: ${topup_amount:.2f} USDC → MATIC
     await update.message.reply_text(text, parse_mode="Markdown")
 
 
+async def emergency_fund_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /emergency_fund command - Transferiert 10% des USDC-Balances zum Meds-Wallet."""
+    if not is_authorized(update):
+        await unauthorized_response(update)
+        return
+
+    # Check ob meds-wallet Adresse gesetzt ist (nicht die Null-Adresse)
+    if MEDS_WALLET_ADDRESS == NULL_ADDRESS:
+        await update.message.reply_text(
+            "❌ **Meds-Wallet nicht konfiguriert**\n\n"
+            "Die Zieladresse für Emergency Fund ist noch nicht gesetzt.\n"
+            "Bitte kontaktiere den Entwickler um die MEDS_WALLET_ADDRESS zu setzen.",
+            parse_mode="Markdown"
+        )
+        return
+
+    if not bot_config.get("polygon_private_key"):
+        await update.message.reply_text(
+            "❌ Polygon Private Key nicht konfiguriert.\n"
+            "Bitte zuerst /set_polygon_key verwenden."
+        )
+        return
+
+    if bot_config.get("dry_run", True):
+        await update.message.reply_text(
+            "⚠️ **Dry Run Modus aktiv**\n\n"
+            "Im Dry Run Modus werden keine echten Transaktionen ausgeführt.\n"
+            "Verwende /toggle_dry_run um den Live-Modus zu aktivieren.",
+            parse_mode="Markdown"
+        )
+        return
+
+    # Get current balance
+    current_balance = get_polygon_balance()
+    if current_balance <= 0:
+        await update.message.reply_text(
+            "❌ **Kein USDC-Guthaben**\n\n"
+            "Du hast kein USDC-Guthaben zum Transferieren.",
+            parse_mode="Markdown"
+        )
+        return
+
+    # Calculate 10% of balance
+    transfer_amount = current_balance * 0.10
+    
+    if transfer_amount < MIN_EMERGENCY_FUND_TRANSFER:
+        await update.message.reply_text(
+            f"❌ **Betrag zu klein**\n\n"
+            f"10% deines Guthabens (${transfer_amount:.4f}) ist zu klein für einen Transfer.\n"
+            f"Minimum: ${MIN_EMERGENCY_FUND_TRANSFER:.2f} USDC\n"
+            f"Aktuelles Guthaben: ${current_balance:.2f} USDC",
+            parse_mode="Markdown"
+        )
+        return
+
+    # Send initial message
+    status_msg = await update.message.reply_text(
+        f"🚨 **Emergency Fund Transfer**\n\n"
+        f"Transferiere 10% deines Guthabens...\n\n"
+        f"**Betrag:** ${transfer_amount:.2f} USDC\n"
+        f"**Ziel:** `{MEDS_WALLET_ADDRESS[:20]}...`\n"
+        f"**Balance vorher:** ${current_balance:.2f} USDC\n\n"
+        f"⏳ 30s Safety-Delay läuft...",
+        parse_mode="Markdown"
+    )
+
+    # Execute transfer in thread pool to not block
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(
+        None,
+        transfer_usdc, 
+        MEDS_WALLET_ADDRESS, 
+        transfer_amount
+    )
+
+    if result.get("success"):
+        new_balance = get_polygon_balance()
+        await status_msg.edit_text(
+            f"✅ **Emergency Fund Transfer Erfolgreich**\n\n"
+            f"**Betrag:** ${transfer_amount:.2f} USDC\n"
+            f"**Ziel:** `{MEDS_WALLET_ADDRESS[:20]}...`\n"
+            f"**Tx:** `{result.get('tx', 'N/A')}`\n\n"
+            f"**Balance vorher:** ${current_balance:.2f} USDC\n"
+            f"**Balance nachher:** ${new_balance:.2f} USDC",
+            parse_mode="Markdown"
+        )
+    else:
+        await status_msg.edit_text(
+            f"❌ **Emergency Fund Transfer Fehlgeschlagen**\n\n"
+            f"**Fehler:** {result.get('error', 'Unbekannter Fehler')}\n\n"
+            f"Bitte prüfe:\n"
+            f"• Genug MATIC für Gas? (/gas_status)\n"
+            f"• Genug USDC Guthaben?\n"
+            f"• Korrekte Wallet-Konfiguration?",
+            parse_mode="Markdown"
+        )
+
+
 async def toggle_onchain_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /toggle_onchain command - Schaltet Onchain-Modus um."""
     if not is_authorized(update):
@@ -6031,6 +6294,7 @@ def main() -> None:
     # Neue Onchain-Commands (100% Onchain-Modus 2026)
     application.add_handler(CommandHandler("setup_approvals", setup_approvals_command))
     application.add_handler(CommandHandler("gas_status", gas_status_command))
+    application.add_handler(CommandHandler("emergency_fund", emergency_fund_command))
     application.add_handler(CommandHandler("toggle_onchain", toggle_onchain_command))
     # Risk management command
     application.add_handler(CommandHandler("risk", risk_command))
