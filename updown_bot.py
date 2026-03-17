@@ -9,14 +9,16 @@ Polymarket CLOB client.
 Includes Solana wallet integration for automatic funding of Polygon balance
 when trading balance is low.
 
+100% Onchain-Modus (2026):
+    - Keine API-Credentials mehr benötigt
+    - L2-Credentials werden automatisch abgeleitet
+    - Nur noch POLYMARKET_PRIVATE_KEY erforderlich
+
 Setup:
     pip install -r requirements.txt
 
     Set the following environment variables (see .env.example):
         POLYMARKET_PRIVATE_KEY
-        POLYMARKET_API_KEY
-        POLYMARKET_API_SECRET
-        POLYMARKET_API_PASSPHRASE
 
     Optional Solana auto-funding:
         SOLANA_PRIVATE_KEY
@@ -40,9 +42,8 @@ from pycoingecko import CoinGeckoAPI
 POLYMARKET_HOST = os.environ.get("POLYMARKET_HOST", "https://clob.polymarket.com")
 CHAIN_ID = int(os.environ.get("POLYMARKET_CHAIN_ID", "137"))  # Polygon Mainnet
 PRIVATE_KEY = os.environ.get("POLYMARKET_PRIVATE_KEY", "")
-API_KEY = os.environ.get("POLYMARKET_API_KEY", "")
-API_SECRET = os.environ.get("POLYMARKET_API_SECRET", "")
-API_PASSPHRASE = os.environ.get("POLYMARKET_API_PASSPHRASE", "")
+# API-Credentials werden im 100% onchain-Modus nicht mehr benötigt
+# Sie werden automatisch aus dem Private Key abgeleitet
 
 # Cycle interval in seconds (default: 5 minutes)
 CYCLE_INTERVAL = int(os.environ.get("CYCLE_INTERVAL_SECONDS", "300"))
@@ -70,24 +71,63 @@ cg = CoinGeckoAPI()
 
 
 def _build_clob_client():
-    """Construct a ClobClient only when credentials are available."""
-    if not all([PRIVATE_KEY, API_KEY, API_SECRET, API_PASSPHRASE]):
+    """Construct a ClobClient im 100% onchain-Modus.
+    
+    Verwendet nur private_key (EOA signature_type=0).
+    L2-Credentials werden automatisch mit derive_api_key() abgeleitet.
+    Keine gespeicherten API-Creds mehr nötig!
+    """
+    if not PRIVATE_KEY:
+        print("Warning: POLYMARKET_PRIVATE_KEY not set. Trading will be disabled.")
         return None
+    
     try:
-        from clob_client.client import ClobClient  # noqa: PLC0415 – optional dep
-        return ClobClient(
+        from py_clob_client.client import ClobClient
+        from py_clob_client.clob_types import ApiCreds
+        
+        # Key mit 0x Prefix normalisieren
+        key = PRIVATE_KEY if PRIVATE_KEY.startswith("0x") else f"0x{PRIVATE_KEY}"
+        
+        # ClobClient im EOA-Modus erstellen (signature_type=0)
+        client = ClobClient(
             host=POLYMARKET_HOST,
-            key=API_KEY,
-            secret=API_SECRET,
-            passphrase=API_PASSPHRASE,
             chain_id=CHAIN_ID,
-            private_key=PRIVATE_KEY,
+            key=key,
+            signature_type=0,  # EOA signature
         )
+        
+        # L2-Credentials automatisch ableiten (wie in offiziellen Docs 2026)
+        try:
+            derived_creds = client.derive_api_key()
+            print("L2-API-Credentials erfolgreich abgeleitet")
+            
+            # Client mit abgeleiteten Credentials neu erstellen
+            client = ClobClient(
+                host=POLYMARKET_HOST,
+                chain_id=CHAIN_ID,
+                key=key,
+                signature_type=0,
+                creds=ApiCreds(
+                    api_key=derived_creds.get("apiKey", ""),
+                    api_secret=derived_creds.get("secret", ""),
+                    api_passphrase=derived_creds.get("passphrase", ""),
+                ),
+            )
+        except Exception as e:
+            # Fallback: Versuche ohne abgeleitete Credentials
+            print(f"Warning: Konnte L2-Credentials nicht ableiten: {e}")
+            print("Verwende Client ohne abgeleitete Credentials")
+        
+        return client
+        
     except ImportError:
         print(
             "Warning: py-clob-client is not installed. "
             "Trading will be disabled. Run: pip install py-clob-client"
         )
+        return None
+    except Exception as e:
+        print(f"Error beim Erstellen des ClobClient: {e}")
         return None
 
 

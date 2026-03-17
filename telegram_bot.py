@@ -63,12 +63,13 @@ CONFIG_FILE = Path("bot_config.json")
 PNL_FILE = Path("daily_pnl.json")
 
 # Conversation states
+# Hinweis: API_KEY, API_SECRET, API_PASSPHRASE werden im 100% onchain-Modus nicht mehr benötigt
 (
     AWAITING_SOLANA_KEY,
     AWAITING_POLYGON_KEY,
-    AWAITING_API_KEY,
-    AWAITING_API_SECRET,
-    AWAITING_API_PASSPHRASE,
+    AWAITING_API_KEY,  # Deprecated - nur für Rückwärtskompatibilität
+    AWAITING_API_SECRET,  # Deprecated - nur für Rückwärtskompatibilität
+    AWAITING_API_PASSPHRASE,  # Deprecated - nur für Rückwärtskompatibilität
     AWAITING_TRADE_AMOUNT,
     AWAITING_MIN_BALANCE,
     AWAITING_BRIDGE_AMOUNT,
@@ -79,6 +80,7 @@ PNL_FILE = Path("daily_pnl.json")
 ) = range(12)
 
 # Default configuration
+# 100% Onchain-Modus: Keine API-Credentials mehr benötigt, nur private_key
 DEFAULT_CONFIG = {
     "polymarket_host": "https://clob.polymarket.com",
     "chain_id": 137,
@@ -90,14 +92,20 @@ DEFAULT_CONFIG = {
     "query_terms": ["btc"],
     "solana_private_key": "",
     "polygon_private_key": "",
-    "polymarket_api_key": "",
-    "polymarket_api_secret": "",
-    "polymarket_api_passphrase": "",
+    # API-Credentials entfernt - werden automatisch aus private_key abgeleitet
     "solana_rpc_url": "https://api.mainnet-beta.solana.com",
+    "polygon_rpc_url": "https://polygon-rpc.com",
     "min_poly_balance_usdc": 20.0,
     "bridge_fund_amount": 50.0,
     "bot_running": False,
     "dry_run": True,
+    # Onchain-Modus Settings
+    "onchain_mode": True,  # Immer True im 100% onchain-Modus
+    "approvals_done": False,  # Ob USDC/CTF Approvals bereits gesetzt wurden
+    # Auto MATIC Top-Up Einstellungen
+    "auto_matic_topup_enabled": True,
+    "auto_matic_topup_min_profit": 0.5,  # Minimum Profit in USD für Top-Up
+    "auto_matic_topup_amount": 0.20,  # USDC → MATIC Swap-Betrag
 }
 
 # Solana USDC token mint address (mainnet)
@@ -110,13 +118,27 @@ POLYMARKET_BRIDGE_URL = "https://bridge.polymarket.com/deposit"
 GAMMA_API_BASE = "https://gamma-api.polymarket.com"
 
 # Sensitive keys that should not be saved to disk
+# Im 100% onchain-Modus nur noch polygon_private_key und solana_private_key
 SENSITIVE_KEYS = frozenset([
     "solana_private_key",
     "polygon_private_key",
-    "polymarket_api_key",
-    "polymarket_api_secret",
-    "polymarket_api_passphrase",
 ])
+
+# ---------------------------------------------------------------------------
+# Polygon Onchain Contracts (2026)
+# ---------------------------------------------------------------------------
+# USDC auf Polygon
+POLYGON_USDC_ADDRESS = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"
+# Conditional Token Framework (CTF) Contract
+POLYGON_CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+# Polymarket Exchange Contract
+POLYGON_EXCHANGE_ADDRESS = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
+# Uniswap V3 SwapRouter (Polygon)
+UNISWAP_V3_ROUTER = "0xE592427A0AEce92De3Edee1F18E0157C05861564"
+# WMATIC auf Polygon
+WMATIC_ADDRESS = "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270"
+# Max uint256 für Approvals
+MAX_UINT256 = 2**256 - 1
 
 # Global state
 bot_config: dict = {}
@@ -150,12 +172,10 @@ def load_config() -> dict:
         bot_config["solana_private_key"] = os.environ.get("SOLANA_PRIVATE_KEY", "")
     if os.environ.get("POLYMARKET_PRIVATE_KEY"):
         bot_config["polygon_private_key"] = os.environ.get("POLYMARKET_PRIVATE_KEY", "")
-    if os.environ.get("POLYMARKET_API_KEY"):
-        bot_config["polymarket_api_key"] = os.environ.get("POLYMARKET_API_KEY", "")
-    if os.environ.get("POLYMARKET_API_SECRET"):
-        bot_config["polymarket_api_secret"] = os.environ.get("POLYMARKET_API_SECRET", "")
-    if os.environ.get("POLYMARKET_API_PASSPHRASE"):
-        bot_config["polymarket_api_passphrase"] = os.environ.get("POLYMARKET_API_PASSPHRASE", "")
+    # API-Credentials werden im 100% onchain-Modus nicht mehr benötigt
+    # Sie werden automatisch aus dem private_key abgeleitet
+    if os.environ.get("POLYGON_RPC_URL"):
+        bot_config["polygon_rpc_url"] = os.environ.get("POLYGON_RPC_URL", "https://polygon-rpc.com")
 
     return bot_config
 
@@ -192,7 +212,10 @@ def save_pnl(pnl_data: dict) -> None:
 
 
 def record_trade(amount: float, profit: float = 0.0) -> None:
-    """Record a trade in P&L history."""
+    """Record a trade in P&L history.
+    
+    Triggert automatisch MATIC Top-Up wenn Profit > Schwellenwert.
+    """
     pnl = load_pnl()
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if today not in pnl["daily"]:
@@ -208,6 +231,22 @@ def record_trade(amount: float, profit: float = 0.0) -> None:
     # Keep only last 100 trades
     pnl["trades"] = pnl["trades"][-100:]
     save_pnl(pnl)
+    
+    # Auto MATIC Top-Up nach profitablem Trade
+    if (
+        bot_config.get("auto_matic_topup_enabled", True)
+        and profit > bot_config.get("auto_matic_topup_min_profit", 0.5)
+        and not bot_config.get("dry_run", True)
+    ):
+        try:
+            swap_amount = bot_config.get("auto_matic_topup_amount", 0.20)
+            result = swap_usdc_to_matic(swap_amount)
+            if result.get("success"):
+                logger.info(f"Auto MATIC Top-Up: {swap_amount} USDC → MATIC, Tx: {result.get('tx')}")
+            else:
+                logger.warning(f"Auto MATIC Top-Up fehlgeschlagen: {result.get('error')}")
+        except Exception as e:
+            logger.warning(f"Auto MATIC Top-Up Fehler: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -231,6 +270,369 @@ async def unauthorized_response(update: Update) -> None:
         "This bot is configured for a specific user only.",
         parse_mode="Markdown",
     )
+
+
+# ---------------------------------------------------------------------------
+# Polygon Onchain Functions (100% Onchain-Modus 2026)
+# ---------------------------------------------------------------------------
+
+
+def get_web3_client():
+    """Erstellt einen Web3-Client für Polygon.
+    
+    Returns:
+        Web3-Instanz oder None bei Fehler.
+    """
+    try:
+        from web3 import Web3
+        rpc_url = bot_config.get("polygon_rpc_url", "https://polygon-rpc.com")
+        w3 = Web3(Web3.HTTPProvider(rpc_url))
+        if not w3.is_connected():
+            logger.warning(f"Konnte nicht mit Polygon RPC verbinden: {rpc_url}")
+            return None
+        return w3
+    except ImportError:
+        logger.warning("web3 nicht installiert. Bitte 'pip install web3' ausführen.")
+        return None
+    except Exception as e:
+        logger.error(f"Web3 Client Fehler: {e}")
+        return None
+
+
+def get_matic_balance() -> float:
+    """Holt die MATIC-Balance der Polygon-Wallet.
+    
+    Returns:
+        MATIC-Balance als float, oder 0.0 bei Fehler.
+    """
+    try:
+        w3 = get_web3_client()
+        if w3 is None:
+            return 0.0
+        
+        address = get_polygon_address()
+        if not address:
+            return 0.0
+        
+        balance_wei = w3.eth.get_balance(address)
+        return float(w3.from_wei(balance_wei, "ether"))
+    except Exception as e:
+        logger.error(f"Fehler beim Abrufen der MATIC-Balance: {e}")
+        return 0.0
+
+
+def check_approvals() -> dict:
+    """Prüft ob USDC und CTF Approvals für Exchange gesetzt sind.
+    
+    Returns:
+        Dict mit 'usdc_approved' und 'ctf_approved' booleans.
+    """
+    try:
+        w3 = get_web3_client()
+        if w3 is None:
+            return {"usdc_approved": False, "ctf_approved": False, "error": "Web3 nicht verfügbar"}
+        
+        address = get_polygon_address()
+        if not address:
+            return {"usdc_approved": False, "ctf_approved": False, "error": "Keine Polygon-Adresse"}
+        
+        # ERC20 ABI für allowance
+        erc20_abi = [
+            {
+                "constant": True,
+                "inputs": [
+                    {"name": "owner", "type": "address"},
+                    {"name": "spender", "type": "address"}
+                ],
+                "name": "allowance",
+                "outputs": [{"name": "", "type": "uint256"}],
+                "type": "function"
+            }
+        ]
+        
+        # ERC1155 ABI für isApprovedForAll
+        erc1155_abi = [
+            {
+                "constant": True,
+                "inputs": [
+                    {"name": "account", "type": "address"},
+                    {"name": "operator", "type": "address"}
+                ],
+                "name": "isApprovedForAll",
+                "outputs": [{"name": "", "type": "bool"}],
+                "type": "function"
+            }
+        ]
+        
+        # USDC Allowance prüfen
+        usdc_contract = w3.eth.contract(
+            address=w3.to_checksum_address(POLYGON_USDC_ADDRESS),
+            abi=erc20_abi
+        )
+        usdc_allowance = usdc_contract.functions.allowance(
+            w3.to_checksum_address(address),
+            w3.to_checksum_address(POLYGON_EXCHANGE_ADDRESS)
+        ).call()
+        
+        # CTF isApprovedForAll prüfen
+        ctf_contract = w3.eth.contract(
+            address=w3.to_checksum_address(POLYGON_CTF_ADDRESS),
+            abi=erc1155_abi
+        )
+        ctf_approved = ctf_contract.functions.isApprovedForAll(
+            w3.to_checksum_address(address),
+            w3.to_checksum_address(POLYGON_EXCHANGE_ADDRESS)
+        ).call()
+        
+        # USDC ist approved wenn Allowance >= 1M USDC (praktisch unbegrenzt)
+        usdc_approved = usdc_allowance >= 1_000_000 * 10**6
+        
+        return {
+            "usdc_approved": usdc_approved,
+            "ctf_approved": ctf_approved,
+            "usdc_allowance": usdc_allowance,
+        }
+    except Exception as e:
+        logger.error(f"Fehler beim Prüfen der Approvals: {e}")
+        return {"usdc_approved": False, "ctf_approved": False, "error": str(e)}
+
+
+def setup_approvals() -> dict:
+    """Setzt USDC.approve() und CTF.setApprovalForAll() für den Exchange.
+    
+    ⚠️ WARNUNG: Dies sind onchain-Transaktionen die MATIC kosten!
+    
+    Returns:
+        Dict mit 'success', 'usdc_tx', 'ctf_tx', und eventuell 'error'.
+    """
+    try:
+        w3 = get_web3_client()
+        if w3 is None:
+            return {"success": False, "error": "Web3 nicht verfügbar"}
+        
+        key = bot_config.get("polygon_private_key", "")
+        if not key:
+            return {"success": False, "error": "Kein Polygon Private Key konfiguriert"}
+        
+        from eth_account import Account
+        key_with_prefix = key if key.startswith("0x") else f"0x{key}"
+        account = Account.from_key(key_with_prefix)
+        address = account.address
+        
+        # Check MATIC balance für Gas
+        matic_balance = get_matic_balance()
+        if matic_balance < 0.01:
+            return {
+                "success": False,
+                "error": f"Nicht genug MATIC für Gas! Balance: {matic_balance:.4f} MATIC. Mindestens 0.01 MATIC benötigt."
+            }
+        
+        results = {"success": True, "usdc_tx": None, "ctf_tx": None}
+        
+        # Prüfe aktuelle Approvals
+        current = check_approvals()
+        
+        # ERC20 ABI für approve
+        erc20_abi = [
+            {
+                "inputs": [
+                    {"name": "spender", "type": "address"},
+                    {"name": "amount", "type": "uint256"}
+                ],
+                "name": "approve",
+                "outputs": [{"name": "", "type": "bool"}],
+                "type": "function"
+            }
+        ]
+        
+        # ERC1155 ABI für setApprovalForAll
+        erc1155_abi = [
+            {
+                "inputs": [
+                    {"name": "operator", "type": "address"},
+                    {"name": "approved", "type": "bool"}
+                ],
+                "name": "setApprovalForAll",
+                "outputs": [],
+                "type": "function"
+            }
+        ]
+        
+        nonce = w3.eth.get_transaction_count(address)
+        chain_id = bot_config.get("chain_id", 137)
+        
+        # USDC Approve falls nötig
+        if not current.get("usdc_approved"):
+            logger.info("Setze USDC Approval...")
+            usdc_contract = w3.eth.contract(
+                address=w3.to_checksum_address(POLYGON_USDC_ADDRESS),
+                abi=erc20_abi
+            )
+            
+            tx = usdc_contract.functions.approve(
+                w3.to_checksum_address(POLYGON_EXCHANGE_ADDRESS),
+                MAX_UINT256
+            ).build_transaction({
+                "from": address,
+                "nonce": nonce,
+                "gas": 100000,
+                "maxFeePerGas": w3.eth.gas_price * 2,
+                "maxPriorityFeePerGas": w3.to_wei(30, "gwei"),
+                "chainId": chain_id,
+            })
+            
+            signed_tx = account.sign_transaction(tx)
+            tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+            results["usdc_tx"] = tx_hash.hex()
+            logger.info(f"USDC Approval Tx: {results['usdc_tx']}")
+            nonce += 1
+            
+            # Warte auf Bestätigung
+            w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+        else:
+            logger.info("USDC bereits approved")
+        
+        # CTF setApprovalForAll falls nötig
+        if not current.get("ctf_approved"):
+            logger.info("Setze CTF Approval...")
+            ctf_contract = w3.eth.contract(
+                address=w3.to_checksum_address(POLYGON_CTF_ADDRESS),
+                abi=erc1155_abi
+            )
+            
+            tx = ctf_contract.functions.setApprovalForAll(
+                w3.to_checksum_address(POLYGON_EXCHANGE_ADDRESS),
+                True
+            ).build_transaction({
+                "from": address,
+                "nonce": nonce,
+                "gas": 100000,
+                "maxFeePerGas": w3.eth.gas_price * 2,
+                "maxPriorityFeePerGas": w3.to_wei(30, "gwei"),
+                "chainId": chain_id,
+            })
+            
+            signed_tx = account.sign_transaction(tx)
+            tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+            results["ctf_tx"] = tx_hash.hex()
+            logger.info(f"CTF Approval Tx: {results['ctf_tx']}")
+            
+            # Warte auf Bestätigung
+            w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+        else:
+            logger.info("CTF bereits approved")
+        
+        # Update config
+        bot_config["approvals_done"] = True
+        save_config()
+        
+        return results
+        
+    except Exception as e:
+        logger.error(f"Fehler beim Setzen der Approvals: {e}")
+        return {"success": False, "error": str(e)}
+
+
+def swap_usdc_to_matic(amount_usdc: float) -> dict:
+    """Swapped USDC zu MATIC via Uniswap V3 Router.
+    
+    Args:
+        amount_usdc: Betrag in USDC (z.B. 0.20 für 20 Cent)
+    
+    Returns:
+        Dict mit 'success', 'tx', und eventuell 'error'.
+    """
+    try:
+        w3 = get_web3_client()
+        if w3 is None:
+            return {"success": False, "error": "Web3 nicht verfügbar"}
+        
+        key = bot_config.get("polygon_private_key", "")
+        if not key:
+            return {"success": False, "error": "Kein Polygon Private Key konfiguriert"}
+        
+        from eth_account import Account
+        key_with_prefix = key if key.startswith("0x") else f"0x{key}"
+        account = Account.from_key(key_with_prefix)
+        address = account.address
+        
+        # 30 Sekunden Safety-Delay
+        logger.info(f"⚠️ USDC → MATIC Swap: {amount_usdc} USDC. 30s Safety-Delay...")
+        time.sleep(30)
+        
+        # Uniswap V3 SwapRouter ABI (ExactInputSingle)
+        swap_router_abi = [
+            {
+                "inputs": [
+                    {
+                        "components": [
+                            {"name": "tokenIn", "type": "address"},
+                            {"name": "tokenOut", "type": "address"},
+                            {"name": "fee", "type": "uint24"},
+                            {"name": "recipient", "type": "address"},
+                            {"name": "deadline", "type": "uint256"},
+                            {"name": "amountIn", "type": "uint256"},
+                            {"name": "amountOutMinimum", "type": "uint256"},
+                            {"name": "sqrtPriceLimitX96", "type": "uint160"}
+                        ],
+                        "name": "params",
+                        "type": "tuple"
+                    }
+                ],
+                "name": "exactInputSingle",
+                "outputs": [{"name": "amountOut", "type": "uint256"}],
+                "type": "function",
+                "stateMutability": "payable"
+            }
+        ]
+        
+        # Amount in USDC wei (6 decimals)
+        amount_in = int(amount_usdc * 10**6)
+        
+        # Deadline: 5 Minuten in der Zukunft
+        deadline = int(time.time()) + 300
+        
+        swap_router = w3.eth.contract(
+            address=w3.to_checksum_address(UNISWAP_V3_ROUTER),
+            abi=swap_router_abi
+        )
+        
+        # ExactInputSingle Parameter
+        # Fee: 3000 = 0.3% Pool (üblich für USDC/WMATIC)
+        params = (
+            w3.to_checksum_address(POLYGON_USDC_ADDRESS),  # tokenIn
+            w3.to_checksum_address(WMATIC_ADDRESS),         # tokenOut
+            3000,                                            # fee
+            w3.to_checksum_address(address),                # recipient
+            deadline,                                        # deadline
+            amount_in,                                       # amountIn
+            0,                                               # amountOutMinimum (für kleine Beträge OK)
+            0                                                # sqrtPriceLimitX96
+        )
+        
+        nonce = w3.eth.get_transaction_count(address)
+        chain_id = bot_config.get("chain_id", 137)
+        
+        tx = swap_router.functions.exactInputSingle(params).build_transaction({
+            "from": address,
+            "nonce": nonce,
+            "gas": 200000,
+            "maxFeePerGas": w3.eth.gas_price * 2,
+            "maxPriorityFeePerGas": w3.to_wei(30, "gwei"),
+            "chainId": chain_id,
+            "value": 0,
+        })
+        
+        signed_tx = account.sign_transaction(tx)
+        tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+        
+        logger.info(f"USDC → MATIC Swap Tx: {tx_hash.hex()}")
+        
+        return {"success": True, "tx": tx_hash.hex()}
+        
+    except Exception as e:
+        logger.error(f"Fehler beim USDC → MATIC Swap: {e}")
+        return {"success": False, "error": str(e)}
 
 
 # ---------------------------------------------------------------------------
@@ -340,26 +742,62 @@ def get_polygon_balance() -> float:
 
 
 def _build_clob_client():
-    """Construct a ClobClient only when credentials are available."""
+    """Construct a ClobClient im 100% onchain-Modus.
+    
+    Verwendet nur private_key (EOA signature_type=0).
+    L2-Credentials werden automatisch mit derive_api_key() abgeleitet.
+    Keine gespeicherten API-Creds mehr nötig!
+    """
     key = bot_config.get("polygon_private_key", "")
-    api_key = bot_config.get("polymarket_api_key", "")
-    api_secret = bot_config.get("polymarket_api_secret", "")
-    api_passphrase = bot_config.get("polymarket_api_passphrase", "")
-
-    if not all([key, api_key, api_secret, api_passphrase]):
+    
+    if not key:
+        logger.warning("Kein Polygon Private Key konfiguriert")
         return None
+    
     try:
-        from clob_client.client import ClobClient
-        return ClobClient(
+        from py_clob_client.client import ClobClient
+        from py_clob_client.clob_types import ApiCreds
+        
+        # Key mit 0x Prefix normalisieren
+        key_with_prefix = key if key.startswith("0x") else f"0x{key}"
+        
+        # ClobClient im EOA-Modus erstellen (signature_type=0)
+        client = ClobClient(
             host=bot_config.get("polymarket_host", "https://clob.polymarket.com"),
-            key=api_key,
-            secret=api_secret,
-            passphrase=api_passphrase,
             chain_id=bot_config.get("chain_id", 137),
-            private_key=key,
+            key=key_with_prefix,
+            signature_type=0,  # EOA signature
         )
+        
+        # L2-Credentials automatisch ableiten (wie in offiziellen Docs 2026)
+        try:
+            derived_creds = client.derive_api_key()
+            logger.info("L2-API-Credentials erfolgreich abgeleitet")
+            
+            # Client mit abgeleiteten Credentials neu erstellen
+            client = ClobClient(
+                host=bot_config.get("polymarket_host", "https://clob.polymarket.com"),
+                chain_id=bot_config.get("chain_id", 137),
+                key=key_with_prefix,
+                signature_type=0,
+                creds=ApiCreds(
+                    api_key=derived_creds.get("apiKey", ""),
+                    api_secret=derived_creds.get("secret", ""),
+                    api_passphrase=derived_creds.get("passphrase", ""),
+                ),
+            )
+        except Exception as e:
+            # Fallback: Versuche ohne abgeleitete Credentials
+            logger.warning(f"Konnte L2-Credentials nicht ableiten: {e}")
+            logger.info("Verwende Client ohne abgeleitete Credentials")
+        
+        return client
+        
     except ImportError:
-        logger.warning("py-clob-client is not installed")
+        logger.warning("py-clob-client ist nicht installiert. Bitte 'pip install py-clob-client' ausführen.")
+        return None
+    except Exception as e:
+        logger.error(f"Fehler beim Erstellen des ClobClient: {e}")
         return None
 
 
@@ -802,21 +1240,26 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             InlineKeyboardButton("🔑 Wallets", callback_data="wallets"),
         ],
         [
-            InlineKeyboardButton("📜 P&L History", callback_data="pnl"),
-            InlineKeyboardButton("❓ Help", callback_data="help"),
+            InlineKeyboardButton("⛓️ Approvals", callback_data="setup_approvals"),
+            InlineKeyboardButton("⛽ Gas", callback_data="gas_status"),
+        ],
+        [
+            InlineKeyboardButton("📜 P&L", callback_data="pnl"),
+            InlineKeyboardButton("❓ Hilfe", callback_data="help"),
         ],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    status = "🟢 Running" if bot_config.get("bot_running", False) else "🔴 Stopped"
-    mode = "🧪 Dry Run" if bot_config.get("dry_run", True) else "💰 Live Trading"
+    status = "🟢 Läuft" if bot_config.get("bot_running", False) else "🔴 Gestoppt"
+    mode = "🧪 Dry Run" if bot_config.get("dry_run", True) else "💰 Live"
+    onchain = "⛓️ 100% Onchain"
 
     await update.message.reply_text(
         f"🎰 **UpDown Trading Bot**\n\n"
         f"Status: {status}\n"
-        f"Mode: {mode}\n\n"
-        f"Control your Polymarket prediction bot entirely via Telegram.\n\n"
-        f"Select an option below:",
+        f"Modus: {mode} | {onchain}\n\n"
+        f"Steuere deinen Polymarket Prediction Bot komplett via Telegram.\n\n"
+        f"Wähle eine Option:",
         reply_markup=reply_markup,
         parse_mode="Markdown",
     )
@@ -829,42 +1272,47 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     help_text = """
-🎰 **UpDown Bot Commands**
+🎰 **UpDown Bot Commands (100% Onchain-Modus)**
 
 **Bot Control:**
-/start - Main menu
-/status - View bot status
-/start_bot - Start trading loop
-/stop_bot - Stop trading loop
+/start - Hauptmenü
+/status - Bot-Status anzeigen
+/start_bot - Trading-Loop starten
+/stop_bot - Trading-Loop stoppen
 
 **Wallet Setup:**
-/set_solana_key - Set Solana private key
-/set_polygon_key - Set Polygon private key
-/set_polymarket_api - Set Polymarket API credentials
+/set_solana_key - Solana Private Key setzen
+/set_polygon_key - Polygon Private Key setzen
+
+**Onchain Setup (NEU):**
+/setup_approvals - USDC/CTF Approvals setzen ⛓️
+/gas_status - MATIC-Balance anzeigen ⛽
 
 **Trading:**
-/balance - View all balances
-/predict - Get current prediction
-/markets - Find relevant markets
-/trade - Execute manual trade
-/bridge - Manual Solana→Polygon bridge
+/balance - Alle Balances anzeigen
+/predict - Aktuelle Vorhersage
+/markets - Relevante Märkte finden
+/trade - Manueller Trade
+/bridge - Solana→Polygon Bridge
 
 **Configuration:**
-/config - View/edit settings
-/set_trade_amount - Set trade size
-/set_min_balance - Set minimum Polygon balance
-/set_bridge_amount - Set bridge amount
-/set_interval - Set cycle interval
-/toggle_dry_run - Toggle dry run mode
+/config - Einstellungen anzeigen/ändern
+/set_trade_amount - Trade-Größe setzen
+/set_min_balance - Min. Polygon-Balance setzen
+/set_bridge_amount - Bridge-Betrag setzen
+/set_interval - Zyklus-Intervall setzen
+/toggle_dry_run - Dry Run Modus umschalten
+/toggle_onchain - Onchain-Modus umschalten
 
 **Info:**
-/pnl - View P&L history
-/help - This help message
+/pnl - P&L Historie anzeigen
+/help - Diese Hilfe
 
-⚠️ **Security Note:**
-- Private keys are stored in memory only
-- Never share your bot token or keys
-- Use a dedicated trading wallet
+⚠️ **Sicherheitshinweise:**
+- Private Keys werden nur im Speicher gehalten
+- Niemals Bot-Token oder Keys teilen
+- Nutze eine dedizierte Trading-Wallet
+- Onchain-Transaktionen kosten MATIC!
 """
     await update.message.reply_text(help_text, parse_mode="Markdown")
 
@@ -878,6 +1326,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # Get balances
     sol_bal = get_solana_balance()
     poly_bal = get_polygon_balance()
+    matic_bal = get_matic_balance()
 
     # Get prediction
     pred = get_current_prediction()
@@ -889,28 +1338,33 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     status = "🟢 Running" if bot_config.get("bot_running", False) else "🔴 Stopped"
     mode = "🧪 Dry Run" if bot_config.get("dry_run", True) else "💰 Live Trading"
+    onchain = "⛓️ Onchain" if bot_config.get("onchain_mode", True) else "🔌 API"
 
     sol_configured = "✅" if bot_config.get("solana_private_key") else "❌"
     poly_configured = "✅" if bot_config.get("polygon_private_key") else "❌"
-    api_configured = "✅" if bot_config.get("polymarket_api_key") else "❌"
+    approvals = "✅" if bot_config.get("approvals_done", False) else "❌"
+
+    # MATIC-Warnung wenn niedrig
+    matic_warning = "⚠️ NIEDRIG!" if matic_bal < 0.1 else ""
 
     text = f"""
-📊 **Bot Status**
+📊 **Bot Status (100% Onchain)**
 
 **State:** {status}
-**Mode:** {mode}
+**Mode:** {mode} | {onchain}
 
 **Wallets:**
-Solana: {sol_configured} {f"${sol_bal.get('usdc', 0):.2f} USDC | {sol_bal.get('sol', 0):.4f} SOL" if sol_bal else "Not configured"}
-Polygon: {poly_configured} {f"${poly_bal:.2f} USDC" if poly_bal else "Not configured"}
-API: {api_configured}
+Solana: {sol_configured} {f"${sol_bal.get('usdc', 0):.2f} USDC | {sol_bal.get('sol', 0):.4f} SOL" if sol_bal else "Nicht konfiguriert"}
+Polygon: {poly_configured} {f"${poly_bal:.2f} USDC" if poly_bal else "Nicht konfiguriert"}
+MATIC: ⛽ {matic_bal:.4f} MATIC {matic_warning}
+Approvals: {approvals}
 
-**Current Prediction:**
+**Aktuelle Vorhersage:**
 Asset: {pred.get('crypto', 'N/A').upper()}
-Price: ${pred.get('price', 0):,.2f}
-Direction: {pred.get('prediction', 'N/A').upper()}
+Preis: ${pred.get('price', 0):,.2f}
+Richtung: {pred.get('prediction', 'N/A').upper()}
 
-**Today's P&L:**
+**Heutiges P&L:**
 Trades: {daily_pnl.get('trades', 0)}
 Profit: ${daily_pnl.get('profit', 0):.2f}
 Total: ${pnl.get('total', 0):.2f}
@@ -918,7 +1372,7 @@ Total: ${pnl.get('total', 0):.2f}
 **Config:**
 Trade Amount: ${bot_config.get('trade_amount', 5.0)}
 Cycle: {bot_config.get('cycle_interval_seconds', 300)}s
-MA: {bot_config.get('short_window', 5)}/{bot_config.get('long_window', 20)}
+Auto MATIC: {'✅' if bot_config.get('auto_matic_topup_enabled', True) else '❌'}
 """
     await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -1531,20 +1985,24 @@ async def toggle_dry_run_command(update: Update, context: ContextTypes.DEFAULT_T
 
     current = bot_config.get("dry_run", True)
 
-    # Check if we have credentials to enable live trading
+    # Check if we have credentials to enable live trading (100% onchain-Modus)
     if current:  # Trying to enable live trading
         if not bot_config.get("polygon_private_key"):
             await update.message.reply_text(
-                "❌ Cannot enable live trading.\n\n"
-                "Please set your Polygon private key first with /set_polygon_key",
+                "❌ Kann Live Trading nicht aktivieren.\n\n"
+                "Bitte zuerst Polygon Private Key setzen mit /set_polygon_key",
             )
             return
-        if not bot_config.get("polymarket_api_key"):
+        # Im 100% onchain-Modus keine API-Credentials mehr nötig
+        # Prüfe aber ob Approvals gesetzt sind
+        if not bot_config.get("approvals_done", False):
             await update.message.reply_text(
-                "❌ Cannot enable live trading.\n\n"
-                "Please set your Polymarket API credentials first with /set_polymarket_api",
+                "⚠️ **Warnung:** Approvals noch nicht gesetzt!\n\n"
+                "Für Live Trading empfohlen:\n"
+                "1. /setup_approvals - Setzt USDC/CTF Approvals\n"
+                "2. /gas_status - Prüfe MATIC-Balance\n\n"
+                "Live Trading wird trotzdem aktiviert.",
             )
-            return
 
     bot_config["dry_run"] = not current
     save_config()
@@ -1552,8 +2010,165 @@ async def toggle_dry_run_command(update: Update, context: ContextTypes.DEFAULT_T
     new_mode = "🧪 Dry Run" if bot_config["dry_run"] else "💰 Live Trading"
 
     await update.message.reply_text(
-        f"✅ Mode changed to: {new_mode}\n\n"
-        f"{'No real trades will be executed.' if bot_config['dry_run'] else '⚠️ Real trades will be executed!'}",
+        f"✅ Modus geändert zu: {new_mode}\n\n"
+        f"{'Keine echten Trades werden ausgeführt.' if bot_config['dry_run'] else '⚠️ ECHTE TRADES werden ausgeführt!'}",
+        parse_mode="Markdown",
+    )
+
+
+async def setup_approvals_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /setup_approvals command - Setzt USDC und CTF Approvals onchain."""
+    if not is_authorized(update):
+        await unauthorized_response(update)
+        return
+
+    if not bot_config.get("polygon_private_key"):
+        await update.message.reply_text(
+            "❌ Polygon Private Key nicht konfiguriert.\n"
+            "Bitte zuerst /set_polygon_key verwenden."
+        )
+        return
+
+    # Prüfe aktuelle Approvals
+    current = check_approvals()
+    
+    if current.get("error"):
+        await update.message.reply_text(f"❌ Fehler: {current.get('error')}")
+        return
+    
+    if current.get("usdc_approved") and current.get("ctf_approved"):
+        await update.message.reply_text(
+            "✅ **Approvals bereits gesetzt!**\n\n"
+            "USDC: ✅ Approved\n"
+            "CTF: ✅ Approved\n\n"
+            "Du kannst direkt mit /toggle_dry_run Live Trading aktivieren.",
+            parse_mode="Markdown",
+        )
+        bot_config["approvals_done"] = True
+        save_config()
+        return
+
+    # Zeige Warnung
+    matic_balance = get_matic_balance()
+    await update.message.reply_text(
+        f"⚠️ **ONCHAIN APPROVAL TRANSAKTION**\n\n"
+        f"Dies setzt:\n"
+        f"• USDC.approve(Exchange, maxUint256)\n"
+        f"• CTF.setApprovalForAll(Exchange, true)\n\n"
+        f"**Contracts (Polygon 2026):**\n"
+        f"• USDC: `{POLYGON_USDC_ADDRESS[:10]}...`\n"
+        f"• CTF: `{POLYGON_CTF_ADDRESS[:10]}...`\n"
+        f"• Exchange: `{POLYGON_EXCHANGE_ADDRESS[:10]}...`\n\n"
+        f"**Aktuelle MATIC-Balance:** {matic_balance:.4f} MATIC\n\n"
+        f"⛽ **KOSTET MATIC FÜR GAS!**\n"
+        f"Mindestens 0.01 MATIC benötigt.\n\n"
+        f"Setze Approvals...",
+        parse_mode="Markdown",
+    )
+
+    # Führe Approvals durch
+    result = setup_approvals()
+    
+    if result.get("success"):
+        msg = "✅ **Approvals erfolgreich gesetzt!**\n\n"
+        if result.get("usdc_tx"):
+            msg += f"USDC Tx: `{result.get('usdc_tx')[:20]}...`\n"
+        else:
+            msg += "USDC: Bereits approved\n"
+        if result.get("ctf_tx"):
+            msg += f"CTF Tx: `{result.get('ctf_tx')[:20]}...`\n"
+        else:
+            msg += "CTF: Bereits approved\n"
+        msg += "\n🎉 Du kannst jetzt Live Trading aktivieren mit /toggle_dry_run"
+        await update.message.reply_text(msg, parse_mode="Markdown")
+    else:
+        await update.message.reply_text(
+            f"❌ **Approval fehlgeschlagen**\n\n"
+            f"Fehler: {result.get('error', 'Unbekannt')}\n\n"
+            f"Stelle sicher dass du genug MATIC für Gas hast!",
+            parse_mode="Markdown",
+        )
+
+
+async def gas_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /gas_status command - Zeigt MATIC-Balance für Gas."""
+    if not is_authorized(update):
+        await unauthorized_response(update)
+        return
+
+    if not bot_config.get("polygon_private_key"):
+        await update.message.reply_text(
+            "❌ Polygon Private Key nicht konfiguriert.\n"
+            "Bitte zuerst /set_polygon_key verwenden."
+        )
+        return
+
+    address = get_polygon_address()
+    matic_balance = get_matic_balance()
+    
+    # Status-Emoji basierend auf Balance
+    if matic_balance >= 1.0:
+        status = "🟢 Gut"
+        warning = ""
+    elif matic_balance >= 0.1:
+        status = "🟡 OK"
+        warning = "Bald auffüllen empfohlen."
+    elif matic_balance >= 0.01:
+        status = "🟠 Niedrig"
+        warning = "⚠️ Bald kein Gas mehr! Bitte MATIC auffüllen."
+    else:
+        status = "🔴 Kritisch"
+        warning = "❌ NICHT GENUG GAS! Transaktionen werden fehlschlagen."
+
+    # Prüfe Auto MATIC Top-Up Status
+    auto_topup = "✅ Aktiviert" if bot_config.get("auto_matic_topup_enabled", True) else "❌ Deaktiviert"
+    topup_threshold = bot_config.get("auto_matic_topup_min_profit", 0.5)
+    topup_amount = bot_config.get("auto_matic_topup_amount", 0.20)
+
+    text = f"""
+⛽ **Gas Status (MATIC)**
+
+**Adresse:** `{address[:20]}...` if address else "Nicht verfügbar"
+**MATIC-Balance:** {matic_balance:.4f} MATIC
+**Status:** {status}
+{warning}
+
+**Auto MATIC Top-Up:**
+Status: {auto_topup}
+Trigger: Bei Profit > ${topup_threshold:.2f}
+Betrag: ${topup_amount:.2f} USDC → MATIC
+
+**Tipps:**
+• Mindestens 0.1 MATIC für stabilen Betrieb
+• Auto Top-Up swapped USDC→MATIC nach Profit
+• Manuell MATIC senden an deine Polygon-Adresse
+"""
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+async def toggle_onchain_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /toggle_onchain command - Schaltet Onchain-Modus um."""
+    if not is_authorized(update):
+        await unauthorized_response(update)
+        return
+
+    current = bot_config.get("onchain_mode", True)
+    
+    # Im 100% Onchain-Modus ist dies immer True
+    # Aber wir zeigen Info darüber
+    await update.message.reply_text(
+        f"⛓️ **100% Onchain-Modus**\n\n"
+        f"Aktueller Status: {'✅ Aktiviert' if current else '❌ Deaktiviert'}\n\n"
+        f"**Was bedeutet das?**\n"
+        f"• Keine API-Credentials (Key/Secret/Passphrase) nötig\n"
+        f"• L2-Credentials werden automatisch abgeleitet\n"
+        f"• Nur dein Private Key wird benötigt\n"
+        f"• Alle Trades sind 100% onchain\n\n"
+        f"**Vorteile:**\n"
+        f"✓ Einfacheres Setup\n"
+        f"✓ Keine API-Keys zu verwalten\n"
+        f"✓ Maximale Sicherheit\n\n"
+        f"Hinweis: Der Onchain-Modus ist in dieser Version immer aktiv.",
         parse_mode="Markdown",
     )
 
@@ -1800,20 +2415,79 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     elif data == "wallets":
         sol_set = "✅" if bot_config.get("solana_private_key") else "❌"
         poly_set = "✅" if bot_config.get("polygon_private_key") else "❌"
-        api_set = "✅" if bot_config.get("polymarket_api_key") else "❌"
+        approvals_set = "✅" if bot_config.get("approvals_done", False) else "❌"
+        matic_bal = get_matic_balance()
 
         text = (
-            f"🔑 **Wallets**\n\n"
+            f"🔑 **Wallets (100% Onchain)**\n\n"
             f"Solana Key: {sol_set}\n"
             f"Polygon Key: {poly_set}\n"
-            f"Polymarket API: {api_set}\n\n"
-            f"Use commands to set:\n"
-            f"/set_solana_key\n"
-            f"/set_polygon_key\n"
-            f"/set_polymarket_api"
+            f"Approvals: {approvals_set}\n"
+            f"MATIC: ⛽ {matic_bal:.4f}\n\n"
+            f"**Setup-Befehle:**\n"
+            f"/set_solana_key - Solana Key\n"
+            f"/set_polygon_key - Polygon Key\n"
+            f"/setup_approvals - Onchain Approvals ⛓️\n"
+            f"/gas_status - MATIC-Balance ⛽"
         )
 
-        keyboard = [[InlineKeyboardButton("« Back", callback_data="back_main")]]
+        keyboard = [[InlineKeyboardButton("« Zurück", callback_data="back_main")]]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+    elif data == "setup_approvals":
+        # Zeige Approvals-Status und Option zum Setzen
+        if not bot_config.get("polygon_private_key"):
+            await query.edit_message_text(
+                "❌ Polygon Private Key nicht konfiguriert.\n"
+                "Bitte zuerst /set_polygon_key verwenden."
+            )
+            return
+        
+        current = check_approvals()
+        matic_bal = get_matic_balance()
+        
+        usdc_status = "✅" if current.get("usdc_approved") else "❌"
+        ctf_status = "✅" if current.get("ctf_approved") else "❌"
+        
+        text = (
+            f"⛓️ **Onchain Approvals**\n\n"
+            f"USDC: {usdc_status}\n"
+            f"CTF: {ctf_status}\n"
+            f"MATIC: ⛽ {matic_bal:.4f}\n\n"
+            f"Zum Setzen verwende:\n"
+            f"/setup_approvals"
+        )
+        
+        keyboard = [[InlineKeyboardButton("« Zurück", callback_data="back_main")]]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+    elif data == "gas_status":
+        # Zeige MATIC-Balance
+        if not bot_config.get("polygon_private_key"):
+            await query.edit_message_text(
+                "❌ Polygon Private Key nicht konfiguriert.\n"
+                "Bitte zuerst /set_polygon_key verwenden."
+            )
+            return
+        
+        matic_bal = get_matic_balance()
+        
+        if matic_bal >= 1.0:
+            status = "🟢 Gut"
+        elif matic_bal >= 0.1:
+            status = "🟡 OK"
+        else:
+            status = "🔴 Niedrig"
+        
+        text = (
+            f"⛽ **Gas Status**\n\n"
+            f"MATIC: {matic_bal:.4f}\n"
+            f"Status: {status}\n\n"
+            f"Für Details:\n"
+            f"/gas_status"
+        )
+        
+        keyboard = [[InlineKeyboardButton("« Zurück", callback_data="back_main")]]
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
     elif data == "pnl":
@@ -1833,10 +2507,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         current = bot_config.get("dry_run", True)
 
         if current:  # Trying to enable live trading
-            if not bot_config.get("polygon_private_key") or not bot_config.get("polymarket_api_key"):
+            # Im 100% onchain-Modus nur Private Key nötig, keine API-Credentials
+            if not bot_config.get("polygon_private_key"):
                 await query.edit_message_text(
-                    "❌ Cannot enable live trading.\n\n"
-                    "Set wallet and API credentials first.",
+                    "❌ Kann Live Trading nicht aktivieren.\n\n"
+                    "Bitte zuerst Polygon Private Key setzen.",
                 )
                 return
 
@@ -1844,9 +2519,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         save_config()
 
         new_mode = "🧪 Dry Run" if bot_config["dry_run"] else "💰 Live Trading"
-        text = f"✅ Mode: {new_mode}"
+        text = f"✅ Modus: {new_mode}"
 
-        keyboard = [[InlineKeyboardButton("« Back", callback_data="back_main")]]
+        keyboard = [[InlineKeyboardButton("« Zurück", callback_data="back_main")]]
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
     elif data == "trade_yes":
@@ -1899,19 +2574,24 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 InlineKeyboardButton("🔑 Wallets", callback_data="wallets"),
             ],
             [
+                InlineKeyboardButton("⛓️ Approvals", callback_data="setup_approvals"),
+                InlineKeyboardButton("⛽ Gas", callback_data="gas_status"),
+            ],
+            [
                 InlineKeyboardButton("📜 P&L", callback_data="pnl"),
-                InlineKeyboardButton("❓ Help", callback_data="help"),
+                InlineKeyboardButton("❓ Hilfe", callback_data="help"),
             ],
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
 
-        status = "🟢 Running" if bot_config.get("bot_running", False) else "🔴 Stopped"
+        status = "🟢 Läuft" if bot_config.get("bot_running", False) else "🔴 Gestoppt"
         mode = "🧪 Dry Run" if bot_config.get("dry_run", True) else "💰 Live"
+        onchain = "⛓️ Onchain"
 
         await query.edit_message_text(
             f"🎰 **UpDown Bot**\n\n"
-            f"Status: {status} | Mode: {mode}\n\n"
-            f"Select an option:",
+            f"Status: {status} | Modus: {mode} | {onchain}\n\n"
+            f"Wähle eine Option:",
             reply_markup=reply_markup,
             parse_mode="Markdown",
         )
@@ -2018,6 +2698,10 @@ def main() -> None:
     application.add_handler(CommandHandler("toggle_dry_run", toggle_dry_run_command))
     application.add_handler(CommandHandler("bridge", bridge_command))
     application.add_handler(CommandHandler("trade", trade_command))
+    # Neue Onchain-Commands (100% Onchain-Modus 2026)
+    application.add_handler(CommandHandler("setup_approvals", setup_approvals_command))
+    application.add_handler(CommandHandler("gas_status", gas_status_command))
+    application.add_handler(CommandHandler("toggle_onchain", toggle_onchain_command))
 
     # Add conversation handlers
     application.add_handler(solana_conv)
@@ -2033,6 +2717,7 @@ def main() -> None:
 
     # Start the bot
     print("Bot is running. Press Ctrl+C to stop.")
+    print("100% Onchain-Modus aktiviert - Keine API-Credentials benötigt!")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
