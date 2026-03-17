@@ -1141,6 +1141,15 @@ def fetch_5min_data(crypto_id: str = "bitcoin", max_retries: int = 3) -> list:
 # Multi-Signal Trading Engine
 # ---------------------------------------------------------------------------
 
+# Signal calculation constants
+RSI_NEUTRAL_ZONE_DIVISOR = 20  # Divisor for neutral zone strength calculation (distance from 50)
+RSI_NEUTRAL_MAX_STRENGTH = 30  # Maximum strength in neutral RSI zone (0-100)
+MACD_HISTOGRAM_NORMALIZE_FACTOR = 10000  # Normalizes histogram relative to price
+MACD_STRENGTH_MULTIPLIER = 10  # Multiplier for MACD strength calculation
+POLYMARKET_DELTA_MAX_STRENGTH_FACTOR = 500  # Max strength at 20% price difference
+POLYMARKET_DELTA_THRESHOLD = 0.02  # Minimum delta to signal a direction
+AGREEMENT_BONUS_PER_SIGNAL = 10  # Confidence bonus per agreeing signal
+
 
 def calculate_ema(prices: list, period: int) -> list:
     """Calculate Exponential Moving Average (EMA).
@@ -1360,11 +1369,10 @@ def calculate_rsi_signal(closes: list) -> dict:
         # Strength increases as RSI approaches 100
         strength = ((rsi - overbought) / (100 - overbought)) * 100
     else:
-        # Neutral zone
+        # Neutral zone - small strength based on distance from 50
         direction = "neutral"
-        # Small strength based on distance from 50
-        strength = abs(rsi - 50) / 20 * 100
-        strength = min(30, strength)  # Cap neutral strength at 30
+        strength = abs(rsi - 50) / RSI_NEUTRAL_ZONE_DIVISOR * 100
+        strength = min(RSI_NEUTRAL_MAX_STRENGTH, strength)
     
     return {
         "direction": direction,
@@ -1395,6 +1403,16 @@ def calculate_macd_signal(closes: list) -> dict:
             "signal_line": 0,
         }
     
+    # Handle empty closes list - return neutral signal
+    if not closes:
+        return {
+            "direction": "neutral",
+            "strength": 0,
+            "histogram": 0,
+            "macd_line": 0,
+            "signal_line": 0,
+        }
+    
     histogram = macd["histogram"]
     macd_line = macd["macd_line"]
     signal_line = macd["signal_line"]
@@ -1407,11 +1425,12 @@ def calculate_macd_signal(closes: list) -> dict:
     else:
         direction = "neutral"
     
-    # Strength based on histogram magnitude
-    # Normalize: typical BTC histogram might be in range -500 to 500
-    current_price = closes[-1] if closes else 1
-    normalized_histogram = abs(histogram) / current_price * 10000
-    strength = min(100, normalized_histogram * 10)
+    # Strength based on histogram magnitude, normalized relative to price
+    current_price = closes[-1]
+    if current_price <= 0:
+        current_price = 1  # Fallback for invalid price
+    normalized_histogram = abs(histogram) / current_price * MACD_HISTOGRAM_NORMALIZE_FACTOR
+    strength = min(100, normalized_histogram * MACD_STRENGTH_MULTIPLIER)
     
     return {
         "direction": direction,
@@ -1438,15 +1457,15 @@ def calculate_polymarket_delta_signal(market_price: float, fair_value: float) ->
     delta = fair_value - market_price
     
     # Direction: positive delta means market is undervalued (buy YES)
-    if delta > 0.02:
+    if delta > POLYMARKET_DELTA_THRESHOLD:
         direction = "up"
-    elif delta < -0.02:
+    elif delta < -POLYMARKET_DELTA_THRESHOLD:
         direction = "down"
     else:
         direction = "neutral"
     
-    # Strength based on delta magnitude (max at 20% difference)
-    strength = min(100, abs(delta) * 500)
+    # Strength based on delta magnitude (max strength at 20% difference)
+    strength = min(100, abs(delta) * POLYMARKET_DELTA_MAX_STRENGTH_FACTOR)
     
     return {
         "direction": direction,
@@ -1497,7 +1516,11 @@ def calculate_confidence_score(closes: list, market: dict | None = None) -> dict
     
     # Calculate fair value for Polymarket (0-1 scale)
     # Higher up_score = higher fair value for YES
-    technical_fair_value = 0.5 + (up_score - down_score) / (total_weight * 2)
+    # Guard against division by zero if all weights are somehow zero
+    if total_weight > 0:
+        technical_fair_value = 0.5 + (up_score - down_score) / (total_weight * 2)
+    else:
+        technical_fair_value = 0.5  # Default neutral fair value
     technical_fair_value = max(0.1, min(0.9, technical_fair_value))  # Clamp to reasonable range
     
     # Get Polymarket price delta
@@ -1519,7 +1542,23 @@ def calculate_confidence_score(closes: list, market: dict | None = None) -> dict
     elif polymarket_signal["direction"] == "down":
         down_score += polymarket_weight * (polymarket_signal["strength"] / 100)
     
-    # Determine final prediction
+    # Determine final prediction (guard against zero total_weight)
+    if total_weight <= 0:
+        return {
+            "prediction": "hold",
+            "confidence": 0,
+            "signals": {
+                "ma_crossover": ma_signal,
+                "rsi": rsi_signal,
+                "macd": macd_signal,
+                "polymarket_delta": polymarket_signal,
+            },
+            "fair_value": 0.5,
+            "polymarket_price": polymarket_data["market_price"],
+            "up_score": 0,
+            "down_score": 0,
+        }
+    
     if up_score > down_score:
         prediction = "up"
         confidence = (up_score / total_weight) * 100
@@ -1536,7 +1575,7 @@ def calculate_confidence_score(closes: list, market: dict | None = None) -> dict
     
     # Bonus for signal agreement (up to 20% bonus for all signals agreeing)
     if agreement_count >= 2:
-        agreement_bonus = (agreement_count - 1) * 10
+        agreement_bonus = (agreement_count - 1) * AGREEMENT_BONUS_PER_SIGNAL
         confidence = min(100, confidence + agreement_bonus)
     
     return {
