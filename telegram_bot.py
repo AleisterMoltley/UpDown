@@ -63,14 +63,10 @@ CONFIG_FILE = Path("bot_config.json")
 PNL_FILE = Path("daily_pnl.json")
 
 # Conversation states
-# Hinweis: API_KEY, API_SECRET, API_PASSPHRASE werden im 100% onchain-Modus nicht mehr benötigt
-# Diese States bleiben für Rückwärtskompatibilität erhalten, werden aber nicht mehr aktiv genutzt
+# 100% Onchain Mode: No API credentials needed, only Private Key
 (
     AWAITING_SOLANA_KEY,
     AWAITING_POLYGON_KEY,
-    AWAITING_API_KEY,  # Deprecated - nicht mehr benötigt im onchain-Modus
-    AWAITING_API_SECRET,  # Deprecated - nicht mehr benötigt im onchain-Modus
-    AWAITING_API_PASSPHRASE,  # Deprecated - nicht mehr benötigt im onchain-Modus
     AWAITING_TRADE_AMOUNT,
     AWAITING_MIN_BALANCE,
     AWAITING_BRIDGE_AMOUNT,
@@ -78,7 +74,7 @@ PNL_FILE = Path("daily_pnl.json")
     AWAITING_MANUAL_TRADE_MARKET,
     AWAITING_MANUAL_TRADE_SIDE,
     AWAITING_MANUAL_TRADE_AMOUNT,
-) = range(12)
+) = range(9)
 
 # Default configuration
 # 100% Onchain-Modus: Keine API-Credentials mehr benötigt, nur private_key
@@ -1667,85 +1663,6 @@ async def set_polygon_key_receive(update: Update, context: ContextTypes.DEFAULT_
     return ConversationHandler.END
 
 
-async def set_api_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Start setting Polymarket API credentials."""
-    if not is_authorized(update):
-        await unauthorized_response(update)
-        return ConversationHandler.END
-
-    await update.message.reply_text(
-        "🔐 **Set Polymarket API Credentials**\n\n"
-        "Step 1/3: Send your **API Key**\n\n"
-        "Send /cancel to abort.",
-        parse_mode="Markdown",
-    )
-    return AWAITING_API_KEY
-
-
-async def set_api_key_receive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Receive API key."""
-    key = update.message.text.strip()
-
-    try:
-        await update.message.delete()
-    except Exception:
-        pass
-
-    context.user_data["api_key"] = key
-
-    await update.message.reply_text(
-        "✅ API Key received.\n\n"
-        "Step 2/3: Now send your **API Secret**",
-        parse_mode="Markdown",
-    )
-    return AWAITING_API_SECRET
-
-
-async def set_api_secret_receive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Receive API secret."""
-    secret = update.message.text.strip()
-
-    try:
-        await update.message.delete()
-    except Exception:
-        pass
-
-    context.user_data["api_secret"] = secret
-
-    await update.message.reply_text(
-        "✅ API Secret received.\n\n"
-        "Step 3/3: Now send your **API Passphrase**",
-        parse_mode="Markdown",
-    )
-    return AWAITING_API_PASSPHRASE
-
-
-async def set_api_passphrase_receive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Receive API passphrase and save all credentials."""
-    passphrase = update.message.text.strip()
-
-    try:
-        await update.message.delete()
-    except Exception:
-        pass
-
-    bot_config["polymarket_api_key"] = context.user_data.get("api_key", "")
-    bot_config["polymarket_api_secret"] = context.user_data.get("api_secret", "")
-    bot_config["polymarket_api_passphrase"] = passphrase
-    save_config()
-
-    # Clear user data
-    context.user_data.clear()
-
-    await update.message.reply_text(
-        "✅ **Polymarket API Credentials Set**\n\n"
-        "All credentials have been stored securely in memory.\n\n"
-        "You can now enable live trading with /toggle_dry_run",
-        parse_mode="Markdown",
-    )
-    return ConversationHandler.END
-
-
 async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Cancel the current conversation."""
     context.user_data.clear()
@@ -2655,16 +2572,6 @@ def main() -> None:
         fallbacks=[CommandHandler("cancel", cancel_conversation)],
     )
 
-    api_conv = ConversationHandler(
-        entry_points=[CommandHandler("set_polymarket_api", set_api_start)],
-        states={
-            AWAITING_API_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_api_key_receive)],
-            AWAITING_API_SECRET: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_api_secret_receive)],
-            AWAITING_API_PASSPHRASE: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_api_passphrase_receive)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel_conversation)],
-    )
-
     trade_amount_conv = ConversationHandler(
         entry_points=[CommandHandler("set_trade_amount", set_trade_amount_start)],
         states={
@@ -2719,7 +2626,6 @@ def main() -> None:
     # Add conversation handlers
     application.add_handler(solana_conv)
     application.add_handler(polygon_conv)
-    application.add_handler(api_conv)
     application.add_handler(trade_amount_conv)
     application.add_handler(min_balance_conv)
     application.add_handler(bridge_amount_conv)
