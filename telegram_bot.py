@@ -142,10 +142,11 @@ DEFAULT_CONFIG = {
     "macd_slow_period": 26,  # MACD slow EMA period
     "macd_signal_period": 9,  # MACD signal line period
     "signal_weights": {
-        "ma_crossover": 30,  # Weight for MA crossover signal
-        "rsi": 30,  # Weight for RSI signal
-        "macd": 25,  # Weight for MACD signal
-        "polymarket_delta": 15,  # Weight for Polymarket price delta
+        "ma_crossover": 27,  # Weight for MA crossover signal
+        "rsi": 27,  # Weight for RSI signal
+        "macd": 23,  # Weight for MACD signal
+        "momentum": 13,  # Weight for momentum signal
+        "volume_momentum": 10,  # Weight for volume_momentum signal
     },
     "rsi_overbought": 70,  # RSI overbought threshold
     "rsi_oversold": 30,  # RSI oversold threshold
@@ -4447,10 +4448,12 @@ async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
     
     await update.message.reply_text(
-        "📊 **Backtest gestartet...**\n\n"
-        "⏳ Lade 30 Tage CoinGecko Daten...\n"
-        "🔄 Simuliere 1000 Trades mit Multi-Signal-Engine...\n"
-        "Dies kann einige Sekunden dauern.",
+        "📊 **Walk-Forward Optimization Backtest gestartet...**\n\n"
+        "⏳ Lade 30 Tage CoinGecko Daten mit Volume...\n"
+        "🔧 Optimiere Parameter pro Trainingsfenster (5-20 Range)...\n"
+        "🔄 Teste auf separaten Testfenstern...\n"
+        "📈 Inklusive volume_momentum Signal (10% Gewicht)...\n\n"
+        "Dies kann 1-2 Minuten dauern.",
         parse_mode="Markdown"
     )
     
@@ -4459,13 +4462,14 @@ async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         crypto_id = bot_config.get("crypto_id", "bitcoin")
         min_confidence = bot_config.get("min_confidence_threshold", 68)
         
-        # Build config for backtest engine
+        # Build config for backtest engine (will be optimized during WFO)
         backtest_config = {
             "signal_weights": bot_config.get("signal_weights", {
-                "ma_crossover": 30,
-                "rsi": 30,
-                "macd": 25,
-                "momentum": 15,
+                "ma_crossover": 27,
+                "rsi": 27,
+                "macd": 23,
+                "momentum": 13,
+                "volume_momentum": 10,
             }),
             "short_window": bot_config.get("short_window", 5),
             "long_window": bot_config.get("long_window", 20),
@@ -4473,7 +4477,7 @@ async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             "rsi_oversold": bot_config.get("rsi_oversold", 30),
         }
         
-        # Run backtest
+        # Run Walk-Forward Optimization backtest
         result = run_backtest(
             crypto_id=crypto_id,
             max_trades=1000,
@@ -4492,6 +4496,9 @@ async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         
         # Save results to daily_pnl.json
         save_backtest_results(result)
+        
+        # Reload config to get optimized params
+        load_config()
         
         # Format and send results
         result_text = format_backtest_results(result)
@@ -4521,7 +4528,7 @@ async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if recommendations:
             result_text += "\n**Empfehlungen:**\n" + "\n".join(recommendations)
         
-        result_text += "\n\n_Ergebnisse gespeichert. Siehe /status für Live vs Backtest Vergleich._"
+        result_text += "\n\n_Optimierte Parameter in bot_config.json gespeichert. Siehe /status für Live vs Backtest Vergleich._"
         
         await update.message.reply_text(result_text, parse_mode="Markdown")
         

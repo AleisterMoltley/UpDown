@@ -2,13 +2,13 @@
 Backtest module for UpDown Telegram Bot.
 
 This module provides historical backtesting capabilities for the multi-signal trading engine.
-It fetches 30 days of 5-minute CoinGecko data and simulates 1000 trades to calculate:
-- Winrate
-- Profit-Factor
-- Max-Drawdown
-- Sharpe-Ratio
+It uses Walk-Forward Optimization to avoid lookahead bias:
+- Splits 30 days into 5 training windows + 1 test window
+- Optimizes SHORT_WINDOW/LONG_WINDOW + RSI thresholds per window with brute-force
+- Includes volume_momentum signal (10% weight)
 
 Results are saved to daily_pnl.json and displayed in Telegram via /backtest and /status commands.
+Optimized parameters are saved to bot_config.json.
 """
 
 import json
@@ -43,8 +43,16 @@ KELLY_AVG_LOSS_PCT = 0.04  # 4% average loss from backtest
 KELLY_MAX_FRACTION = 0.25  # Maximum 25% Kelly fraction
 KELLY_MIN_TRADE_USD = 3.0  # Minimum $3 per trade
 
-# File path for storing backtest results (same as PNL file for integration)
+# Walk-Forward Optimization constants
+WFO_NUM_TRAINING_WINDOWS = 5  # 5 training windows
+WFO_PARAM_RANGE_MIN = 5  # Minimum value for parameter optimization
+WFO_PARAM_RANGE_MAX = 20  # Maximum value for parameter optimization
+VOLUME_MOMENTUM_WEIGHT = 10  # 10% weight for volume_momentum signal
+VOLUME_MOMENTUM_BONUS = 15  # +15 confidence when volume & price both rise
+
+# File paths
 BACKTEST_RESULTS_FILE = Path("daily_pnl.json")
+CONFIG_FILE = Path("bot_config.json")
 
 logger = logging.getLogger(__name__)
 
@@ -258,15 +266,20 @@ def calculate_macd_signal(closes: list) -> dict:
     }
 
 
-def calculate_confidence_backtest(closes: list, config: dict | None = None) -> dict:
+def calculate_confidence_backtest(
+    closes: list,
+    config: dict | None = None,
+    volumes: list | None = None,
+) -> dict:
     """Calculate confidence score for backtesting (Multi-Signal Engine).
     
     This is a standalone version of the multi-signal engine for backtesting,
-    without Polymarket API dependencies.
+    without Polymarket API dependencies. Includes volume_momentum signal.
     
     Args:
         closes: List of closing prices.
         config: Optional configuration dict with signal weights and thresholds.
+        volumes: Optional list of volume values for volume_momentum signal.
     
     Returns:
         Dictionary with direction, confidence_score, and signal details.
@@ -274,12 +287,15 @@ def calculate_confidence_backtest(closes: list, config: dict | None = None) -> d
     if config is None:
         config = {}
     
-    # Signal weights
+    # Signal weights - now includes volume_momentum at 10%
+    # Adjusted from original: ma_crossover=30, rsi=30, macd=25, momentum=15
+    # New: ma_crossover=27, rsi=27, macd=23, momentum=13, volume_momentum=10
     weights = config.get("signal_weights", {
-        "ma_crossover": 30,
-        "rsi": 30,
-        "macd": 25,
-        "momentum": 15,  # Use momentum instead of Polymarket delta for backtest
+        "ma_crossover": 27,
+        "rsi": 27,
+        "macd": 23,
+        "momentum": 13,
+        "volume_momentum": VOLUME_MOMENTUM_WEIGHT,  # 10% weight
     })
     
     short_window = config.get("short_window", 5)
@@ -308,6 +324,18 @@ def calculate_confidence_backtest(closes: list, config: dict | None = None) -> d
         "momentum_pct": momentum_pct,
     }
     
+    # Calculate volume momentum signal (new)
+    if volumes is not None and len(volumes) >= 20:
+        volume_signal = calculate_volume_momentum_signal(closes, volumes)
+    else:
+        volume_signal = {
+            "direction": "neutral",
+            "strength": 0,
+            "volume_rising": False,
+            "price_rising": False,
+            "bonus": 0,
+        }
+    
     # Aggregate scores
     up_score = 0
     down_score = 0
@@ -318,8 +346,9 @@ def calculate_confidence_backtest(closes: list, config: dict | None = None) -> d
         ("rsi", rsi_signal),
         ("macd", macd_signal),
         ("momentum", momentum_signal),
+        ("volume_momentum", volume_signal),
     ]:
-        weight = weights.get(signal_name, 25)
+        weight = weights.get(signal_name, 0)
         total_weight += weight
         
         if signal["direction"] == "up":
@@ -336,6 +365,7 @@ def calculate_confidence_backtest(closes: list, config: dict | None = None) -> d
                 "rsi": rsi_signal,
                 "macd": macd_signal,
                 "momentum": momentum_signal,
+                "volume_momentum": volume_signal,
             },
         }
     
@@ -358,6 +388,10 @@ def calculate_confidence_backtest(closes: list, config: dict | None = None) -> d
         agreement_bonus = (agreement_count - 1) * 10
         confidence = min(100, confidence + agreement_bonus)
     
+    # Volume momentum bonus: +15 confidence when volume rises AND price rises
+    if volume_signal.get("bonus", 0) > 0 and direction == "up":
+        confidence = min(100, confidence + volume_signal["bonus"])
+    
     return {
         "direction": direction,
         "confidence_score": round(confidence, 1),
@@ -366,6 +400,7 @@ def calculate_confidence_backtest(closes: list, config: dict | None = None) -> d
             "rsi": rsi_signal,
             "macd": macd_signal,
             "momentum": momentum_signal,
+            "volume_momentum": volume_signal,
         },
     }
 
@@ -482,6 +517,52 @@ def fetch_30day_data(crypto_id: str = "bitcoin", max_retries: int = 3) -> list |
     return None
 
 
+def fetch_30day_data_with_volume(crypto_id: str = "bitcoin", max_retries: int = 3) -> dict | None:
+    """Fetch 30 days of price AND volume data from CoinGecko for backtesting.
+    
+    Uses get_coin_market_chart_by_id to get both prices and total_volumes.
+    
+    Args:
+        crypto_id: Cryptocurrency ID for CoinGecko API (e.g., 'bitcoin').
+        max_retries: Number of retry attempts for transient failures.
+    
+    Returns:
+        Dictionary with 'prices' and 'volumes' lists, or None on error.
+    """
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            # CoinGecko returns hourly data when days <= 90
+            data = cg.get_coin_market_chart_by_id(
+                id=crypto_id,
+                vs_currency="usd",
+                days=BACKTEST_DAYS,
+            )
+            
+            if not data or "prices" not in data:
+                logger.warning(f"No price data returned from CoinGecko for {crypto_id}")
+                return None
+            
+            prices = data.get("prices", [])
+            volumes = data.get("total_volumes", [])
+            
+            if len(prices) < 24:  # Need at least 1 day of hourly data
+                logger.warning(f"Insufficient data from CoinGecko: {len(prices)} points")
+                return None
+            
+            logger.info(f"Fetched {len(prices)} hourly data points with volume for {crypto_id}")
+            return {"prices": prices, "volumes": volumes}
+            
+        except Exception as e:
+            last_error = e
+            logger.warning(f"CoinGecko API error (attempt {attempt + 1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)  # Exponential backoff
+    
+    logger.error(f"Failed to fetch 30-day data with volume after {max_retries} attempts: {last_error}")
+    return None
+
+
 def interpolate_to_5min(hourly_prices: list) -> list:
     """Interpolate hourly price data to approximate 5-minute intervals.
     
@@ -516,6 +597,105 @@ def interpolate_to_5min(hourly_prices: list) -> list:
     return result
 
 
+def interpolate_volumes_to_5min(hourly_volumes: list) -> list:
+    """Interpolate hourly volume data to approximate 5-minute intervals.
+    
+    Args:
+        hourly_volumes: List of [timestamp, volume] from CoinGecko.
+    
+    Returns:
+        List of [timestamp, volume] at 5-minute intervals.
+    """
+    if len(hourly_volumes) < 2:
+        return hourly_volumes
+    
+    result = []
+    for i in range(len(hourly_volumes) - 1):
+        t1, v1 = hourly_volumes[i]
+        t2, v2 = hourly_volumes[i + 1]
+        
+        # Add 12 points per hour (5-minute intervals)
+        # Distribute volume evenly across the 5-min intervals
+        for j in range(12):
+            fraction = j / 12
+            timestamp = t1 + (t2 - t1) * fraction
+            # Linear interpolation for volume
+            volume = v1 + (v2 - v1) * fraction
+            result.append([timestamp, volume])
+    
+    if hourly_volumes:
+        result.append(hourly_volumes[-1])
+    
+    return result
+
+
+def calculate_volume_momentum_signal(
+    closes: list,
+    volumes: list,
+    short_period: int = 5,
+    long_period: int = 20,
+) -> dict:
+    """Calculate volume momentum signal.
+    
+    Compares 5-period volume MA vs 20-period volume MA.
+    If volume rises AND price rises, returns bullish signal with +15 bonus.
+    
+    Args:
+        closes: List of closing prices.
+        volumes: List of volume values (same length as closes).
+        short_period: Short MA period for volume (default 5).
+        long_period: Long MA period for volume (default 20).
+    
+    Returns:
+        Dictionary with direction, strength, volume_rising, price_rising, bonus.
+    """
+    if len(volumes) < long_period or len(closes) < long_period:
+        return {
+            "direction": "neutral",
+            "strength": 0,
+            "volume_rising": False,
+            "price_rising": False,
+            "bonus": 0,
+        }
+    
+    # Calculate volume MAs
+    vol_short_ma = sum(volumes[-short_period:]) / short_period
+    vol_long_ma = sum(volumes[-long_period:]) / long_period
+    
+    # Calculate price change (recent vs earlier)
+    price_short_avg = sum(closes[-short_period:]) / short_period
+    price_long_avg = sum(closes[-long_period:]) / long_period
+    
+    volume_rising = vol_short_ma > vol_long_ma
+    price_rising = price_short_avg > price_long_avg
+    
+    # Determine direction and strength
+    if volume_rising and price_rising:
+        direction = "up"
+        strength = min(100, ((vol_short_ma / vol_long_ma) - 1) * 200 + 50)
+        bonus = VOLUME_MOMENTUM_BONUS  # +15 confidence bonus
+    elif volume_rising and not price_rising:
+        direction = "down"  # Volume rising but price falling = potential reversal
+        strength = min(100, ((vol_short_ma / vol_long_ma) - 1) * 150 + 30)
+        bonus = 0
+    elif not volume_rising and price_rising:
+        direction = "neutral"  # Price rising without volume = weak signal
+        strength = 20
+        bonus = 0
+    else:
+        direction = "neutral"
+        strength = 0
+        bonus = 0
+    
+    return {
+        "direction": direction,
+        "strength": min(100, max(0, strength)),
+        "volume_rising": volume_rising,
+        "price_rising": price_rising,
+        "bonus": bonus,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Backtesting Engine
 # ---------------------------------------------------------------------------
@@ -538,6 +718,10 @@ class BacktestResult:
         self.run_timestamp: str = ""
         self.crypto_id: str = "bitcoin"
         self.data_points: int = 0
+        # Walk-Forward Optimization results
+        self.optimized_params: dict = {}
+        self.wfo_windows: list = []
+        self.is_walk_forward: bool = False
     
     @property
     def winrate(self) -> float:
@@ -561,7 +745,7 @@ class BacktestResult:
     
     def to_dict(self) -> dict:
         """Convert results to dictionary for JSON serialization."""
-        return {
+        result = {
             "run_timestamp": self.run_timestamp,
             "crypto_id": self.crypto_id,
             "data_points": self.data_points,
@@ -578,6 +762,205 @@ class BacktestResult:
             "max_drawdown": round(self.max_drawdown, 2),
             "sharpe_ratio": round(self.sharpe_ratio, 2),
         }
+        if self.is_walk_forward:
+            result["optimized_params"] = self.optimized_params
+            result["wfo_windows"] = self.wfo_windows
+            result["is_walk_forward"] = True
+        return result
+
+
+# ---------------------------------------------------------------------------
+# Walk-Forward Optimization Functions
+# ---------------------------------------------------------------------------
+
+
+def optimize_params_brute_force(
+    closes: list,
+    volumes: list,
+    min_confidence: int,
+    trade_size_pct: float,
+    param_range: tuple = (WFO_PARAM_RANGE_MIN, WFO_PARAM_RANGE_MAX),
+) -> dict:
+    """Brute-force optimization of SHORT_WINDOW, LONG_WINDOW, RSI thresholds.
+    
+    Tests all combinations in the parameter range and returns the best params
+    based on profit factor.
+    
+    Args:
+        closes: List of closing prices for the training window.
+        volumes: List of volume values for the training window.
+        min_confidence: Minimum confidence threshold.
+        trade_size_pct: Trade size as percentage of balance.
+        param_range: Tuple of (min, max) for parameter range.
+    
+    Returns:
+        Dictionary with best parameters and their performance metrics.
+    """
+    min_val, max_val = param_range
+    best_profit_factor = 0.0
+    best_params = {
+        "short_window": 5,
+        "long_window": 20,
+        "rsi_overbought": 70,
+        "rsi_oversold": 30,
+    }
+    best_metrics = {"winrate": 0, "profit_factor": 0, "trades": 0}
+    
+    # Brute-force search through parameter combinations
+    for short_window in range(min_val, max_val + 1):
+        for long_window in range(short_window + 2, max_val + 1):  # long > short + 1
+            for rsi_ob in range(65, 81, 5):  # RSI overbought: 65, 70, 75, 80
+                for rsi_os in range(20, 36, 5):  # RSI oversold: 20, 25, 30, 35
+                    config = {
+                        "short_window": short_window,
+                        "long_window": long_window,
+                        "rsi_overbought": rsi_ob,
+                        "rsi_oversold": rsi_os,
+                    }
+                    
+                    # Run mini backtest on training data
+                    metrics = _run_mini_backtest(
+                        closes, volumes, config, min_confidence, trade_size_pct
+                    )
+                    
+                    # Select based on profit factor (with minimum trades requirement)
+                    if metrics["trades"] >= 5 and metrics["profit_factor"] > best_profit_factor:
+                        best_profit_factor = metrics["profit_factor"]
+                        best_params = config.copy()
+                        best_metrics = metrics.copy()
+    
+    logger.debug(
+        f"Optimization result: short={best_params['short_window']}, "
+        f"long={best_params['long_window']}, PF={best_profit_factor:.2f}"
+    )
+    
+    return {
+        "params": best_params,
+        "metrics": best_metrics,
+    }
+
+
+def _run_mini_backtest(
+    closes: list,
+    volumes: list,
+    config: dict,
+    min_confidence: int,
+    trade_size_pct: float,
+) -> dict:
+    """Run a mini backtest for parameter optimization.
+    
+    Args:
+        closes: Price data.
+        volumes: Volume data.
+        config: Signal engine configuration.
+        min_confidence: Minimum confidence threshold.
+        trade_size_pct: Trade size percentage.
+    
+    Returns:
+        Dictionary with winrate, profit_factor, trades count.
+    """
+    min_window = 40
+    if len(closes) < min_window + TRADE_HOLDING_PERIOD_CANDLES:
+        return {"winrate": 0, "profit_factor": 0, "trades": 0}
+    
+    winning = 0
+    losing = 0
+    total_profit = 0.0
+    total_loss = 0.0
+    balance = 1000.0
+    
+    # Step through data
+    max_trades = 100  # Limit for optimization speed
+    step_size = max(1, (len(closes) - min_window) // (max_trades * 2))
+    
+    i = min_window
+    trades_count = 0
+    while i < len(closes) - TRADE_HOLDING_PERIOD_CANDLES and trades_count < max_trades:
+        window_closes = closes[max(0, i - 100):i]
+        window_volumes = volumes[max(0, i - 100):i] if volumes else None
+        
+        if len(window_closes) < min_window:
+            i += step_size
+            continue
+        
+        conf_result = calculate_confidence_backtest(window_closes, config, window_volumes)
+        direction = conf_result["direction"]
+        confidence = conf_result["confidence_score"]
+        
+        if direction == "hold" or confidence < min_confidence:
+            i += step_size
+            continue
+        
+        current_price = closes[i]
+        future_price = closes[i + TRADE_HOLDING_PERIOD_CANDLES]
+        
+        price_change_pct = ((future_price - current_price) / current_price) * 100
+        trade_size = balance * trade_size_pct
+        
+        if direction == "up":
+            profit = trade_size * (price_change_pct / 100)
+        else:
+            profit = trade_size * (-price_change_pct / 100)
+        
+        if profit > 0:
+            winning += 1
+            total_profit += profit
+        else:
+            losing += 1
+            total_loss += profit
+        
+        balance += profit
+        trades_count += 1
+        i += TRADE_HOLDING_PERIOD_CANDLES + step_size
+    
+    total_trades = winning + losing
+    winrate = (winning / total_trades * 100) if total_trades > 0 else 0
+    profit_factor = (total_profit / abs(total_loss)) if total_loss != 0 else (float("inf") if total_profit > 0 else 0)
+    
+    return {
+        "winrate": winrate,
+        "profit_factor": profit_factor if profit_factor != float("inf") else 999.0,
+        "trades": total_trades,
+    }
+
+
+def save_optimized_params(params: dict) -> None:
+    """Save optimized parameters to bot_config.json.
+    
+    Args:
+        params: Dictionary with optimized parameters.
+    """
+    try:
+        # Load existing config
+        if CONFIG_FILE.exists():
+            with open(CONFIG_FILE, "r") as f:
+                config = json.load(f)
+        else:
+            config = {}
+        
+        # Update with optimized params
+        config["short_window"] = params.get("short_window", 5)
+        config["long_window"] = params.get("long_window", 20)
+        config["rsi_overbought"] = params.get("rsi_overbought", 70)
+        config["rsi_oversold"] = params.get("rsi_oversold", 30)
+        config["wfo_last_optimized"] = datetime.now(timezone.utc).isoformat()
+        
+        # Update signal weights to include volume_momentum
+        if "signal_weights" not in config:
+            config["signal_weights"] = {}
+        config["signal_weights"]["ma_crossover"] = 27
+        config["signal_weights"]["rsi"] = 27
+        config["signal_weights"]["macd"] = 23
+        config["signal_weights"]["momentum"] = 13
+        config["signal_weights"]["volume_momentum"] = VOLUME_MOMENTUM_WEIGHT
+        
+        # Save config
+        with open(CONFIG_FILE, "w") as f:
+            json.dump(config, f, indent=2)
+        
+        logger.info(f"Optimized params saved to {CONFIG_FILE}: {params}")
+    except Exception as e:
+        logger.error(f"Failed to save optimized params: {e}")
 
 
 def run_backtest(
@@ -587,7 +970,11 @@ def run_backtest(
     trade_size_pct: float = BACKTEST_TRADE_SIZE_PCT,
     config: dict | None = None,
 ) -> BacktestResult | None:
-    """Run a backtest simulation using the multi-signal engine.
+    """Run Walk-Forward Optimization backtest.
+    
+    Splits 30 days into 5 training windows + 1 test window.
+    Optimizes SHORT_WINDOW/LONG_WINDOW + RSI thresholds per training window.
+    Tests on the subsequent window to avoid lookahead bias.
     
     Args:
         crypto_id: CoinGecko cryptocurrency ID to backtest.
@@ -599,26 +986,48 @@ def run_backtest(
     Returns:
         BacktestResult object with all metrics, or None on failure.
     """
-    logger.info(f"Starting backtest for {crypto_id} with max {max_trades} trades")
+    logger.info(f"Starting Walk-Forward Optimization backtest for {crypto_id}")
     
-    # Fetch historical data
-    hourly_prices = fetch_30day_data(crypto_id)
-    if hourly_prices is None:
+    # Fetch historical data with volume
+    data = fetch_30day_data_with_volume(crypto_id)
+    if data is None:
         logger.error("Failed to fetch historical data for backtest")
         return None
     
-    # Interpolate to 5-minute intervals for more trading opportunities
-    prices_5min = interpolate_to_5min(hourly_prices)
-    logger.info(f"Interpolated to {len(prices_5min)} 5-minute data points")
+    hourly_prices = data["prices"]
+    hourly_volumes = data["volumes"]
     
-    # Extract close prices
+    # Interpolate to 5-minute intervals
+    prices_5min = interpolate_to_5min(hourly_prices)
+    volumes_5min = interpolate_volumes_to_5min(hourly_volumes)
+    logger.info(f"Interpolated to {len(prices_5min)} 5-minute data points with volume")
+    
+    # Extract close prices and volumes
     closes = [p[1] for p in prices_5min]
+    volumes = [v[1] for v in volumes_5min]
+    
+    # Ensure volumes list matches closes length
+    if len(volumes) < len(closes):
+        volumes.extend([volumes[-1]] * (len(closes) - len(volumes)))
+    elif len(volumes) > len(closes):
+        volumes = volumes[:len(closes)]
     
     # Initialize result
     result = BacktestResult()
     result.crypto_id = crypto_id
     result.data_points = len(prices_5min)
     result.run_timestamp = datetime.now(timezone.utc).isoformat()
+    result.is_walk_forward = True
+    
+    # Walk-Forward Optimization: Split into 5 training + 1 test window (6 windows total)
+    total_windows = WFO_NUM_TRAINING_WINDOWS + 1  # 5 training + 1 test = 6
+    window_size = len(closes) // total_windows
+    
+    if window_size < 100:
+        logger.warning("Insufficient data for Walk-Forward Optimization, falling back to simple backtest")
+        return _run_simple_backtest(closes, volumes, min_confidence, trade_size_pct, config)
+    
+    logger.info(f"WFO: {total_windows} windows, {window_size} data points each")
     
     # Initialize simulation state
     balance = BACKTEST_INITIAL_BALANCE
@@ -626,81 +1035,302 @@ def run_backtest(
     peak_balance = balance
     max_drawdown = 0.0
     returns = []
-    trades_count = 0
+    wfo_windows = []
+    final_best_params = {}
     
-    # Minimum data window needed for signals (MACD needs 35 points: 26 + 9)
+    # Walk through windows: optimize on training, test on next window
+    for window_idx in range(WFO_NUM_TRAINING_WINDOWS):
+        train_start = window_idx * window_size
+        train_end = train_start + window_size
+        test_start = train_end
+        test_end = min(test_start + window_size, len(closes))
+        
+        if test_end <= test_start:
+            break
+        
+        train_closes = closes[train_start:train_end]
+        train_volumes = volumes[train_start:train_end]
+        test_closes = closes[test_start:test_end]
+        test_volumes = volumes[test_start:test_end]
+        
+        logger.info(f"WFO Window {window_idx + 1}: Train[{train_start}:{train_end}], Test[{test_start}:{test_end}]")
+        
+        # Optimize parameters on training window
+        opt_result = optimize_params_brute_force(
+            train_closes, train_volumes, min_confidence, trade_size_pct
+        )
+        best_params = opt_result["params"]
+        opt_metrics = opt_result["metrics"]
+        
+        logger.info(
+            f"Window {window_idx + 1} optimal params: "
+            f"short={best_params['short_window']}, long={best_params['long_window']}, "
+            f"rsi_ob={best_params['rsi_overbought']}, rsi_os={best_params['rsi_oversold']}, "
+            f"train_PF={opt_metrics['profit_factor']:.2f}"
+        )
+        
+        # Test on the next window using optimized parameters
+        window_result = _test_on_window(
+            test_closes, test_volumes, best_params, min_confidence, trade_size_pct, balance
+        )
+        
+        # Update cumulative results
+        result.winning_trades += window_result["winning"]
+        result.losing_trades += window_result["losing"]
+        result.total_profit += window_result["profit"]
+        result.total_loss += window_result["loss"]
+        result.trades.extend(window_result["trades"])
+        
+        # Update balance and equity curve
+        balance = window_result["final_balance"]
+        equity_curve.extend(window_result["equity_curve"])
+        
+        # Track returns
+        returns.extend(window_result["returns"])
+        
+        # Track drawdown
+        for eq in window_result["equity_curve"]:
+            if eq > peak_balance:
+                peak_balance = eq
+            current_dd = ((peak_balance - eq) / peak_balance) * 100 if peak_balance > 0 else 0
+            max_drawdown = max(max_drawdown, current_dd)
+        
+        # Record window results
+        wfo_windows.append({
+            "window": window_idx + 1,
+            "params": best_params,
+            "train_metrics": opt_metrics,
+            "test_trades": window_result["trades_count"],
+            "test_winrate": window_result["winrate"],
+        })
+        
+        # Keep track of best params (from last window for final use)
+        final_best_params = best_params
+    
+    # Finalize results
+    result.final_balance = balance
+    result.equity_curve = equity_curve
+    result.max_drawdown = max_drawdown
+    result.optimized_params = final_best_params
+    result.wfo_windows = wfo_windows
+    
+    # Calculate Sharpe Ratio
+    if len(returns) > 1:
+        mean_return = np.mean(returns)
+        std_return = np.std(returns)
+        if std_return > 0:
+            result.sharpe_ratio = (mean_return / std_return) * SHARPE_ANNUALIZATION_FACTOR
+        else:
+            result.sharpe_ratio = 0.0
+    else:
+        result.sharpe_ratio = 0.0
+    
+    # Save optimized parameters to bot_config.json
+    if final_best_params:
+        save_optimized_params(final_best_params)
+    
+    logger.info(
+        f"Walk-Forward backtest completed: {result.total_trades} trades, "
+        f"Winrate: {result.winrate:.1f}%, "
+        f"Profit Factor: {result.profit_factor:.2f}, "
+        f"Max Drawdown: {result.max_drawdown:.1f}%"
+    )
+    
+    return result
+
+
+def _test_on_window(
+    closes: list,
+    volumes: list,
+    params: dict,
+    min_confidence: int,
+    trade_size_pct: float,
+    starting_balance: float,
+) -> dict:
+    """Test trading on a window using specified parameters.
+    
+    Args:
+        closes: Price data for the test window.
+        volumes: Volume data for the test window.
+        params: Optimized parameters to use.
+        min_confidence: Minimum confidence threshold.
+        trade_size_pct: Trade size percentage.
+        starting_balance: Starting balance for this window.
+    
+    Returns:
+        Dictionary with test results.
+    """
     min_window = 40
     
-    # Step through data simulating trades
-    # Divide by 2 to account for lookahead periods and spacing between trades
-    # This ensures we have room for trade entry, holding period, and gap to next trade
-    step_size = max(1, (len(closes) - min_window) // (max_trades * 2))
+    winning = 0
+    losing = 0
+    total_profit = 0.0
+    total_loss = 0.0
+    balance = starting_balance
+    equity_curve = []
+    returns = []
+    trades = []
+    
+    # Configure for this window
+    config = {
+        "short_window": params["short_window"],
+        "long_window": params["long_window"],
+        "rsi_overbought": params["rsi_overbought"],
+        "rsi_oversold": params["rsi_oversold"],
+    }
+    
+    step_size = max(1, (len(closes) - min_window) // 50)
     
     i = min_window
-    while i < len(closes) and trades_count < max_trades:
-        # Get historical window
-        window = closes[max(0, i - 100):i]
+    while i < len(closes) - TRADE_HOLDING_PERIOD_CANDLES:
+        window_closes = closes[max(0, i - 100):i]
+        window_volumes = volumes[max(0, i - 100):i] if volumes else None
         
-        if len(window) < min_window:
+        if len(window_closes) < min_window:
             i += step_size
             continue
         
-        # Calculate confidence
-        conf_result = calculate_confidence_backtest(window, config)
+        conf_result = calculate_confidence_backtest(window_closes, config, window_volumes)
         direction = conf_result["direction"]
         confidence = conf_result["confidence_score"]
         
-        # Skip if below threshold or hold signal
         if direction == "hold" or confidence < min_confidence:
             i += step_size
             continue
         
-        # Execute trade
         current_price = closes[i]
+        future_price = closes[i + TRADE_HOLDING_PERIOD_CANDLES]
         
-        # Look ahead to determine outcome (holding period defined by constant)
-        lookahead = min(TRADE_HOLDING_PERIOD_CANDLES, len(closes) - i - 1)
-        if lookahead <= 0:
-            break
-        
-        future_price = closes[i + lookahead]
-        
-        # Calculate trade outcome
         price_change_pct = ((future_price - current_price) / current_price) * 100
-        
-        # Trade size based on balance
         trade_size = balance * trade_size_pct
         
-        # Determine if trade was profitable
         if direction == "up":
             profit = trade_size * (price_change_pct / 100)
-        else:  # direction == "down"
+        else:
             profit = trade_size * (-price_change_pct / 100)
         
-        # Update statistics
+        if profit > 0:
+            winning += 1
+            total_profit += profit
+        else:
+            losing += 1
+            total_loss += profit
+        
+        prev_balance = balance
+        balance += profit
+        equity_curve.append(balance)
+        
+        if prev_balance > 0:
+            returns.append((balance - prev_balance) / prev_balance)
+        
+        trades.append({
+            "index": i,
+            "direction": direction,
+            "confidence": confidence,
+            "entry_price": current_price,
+            "exit_price": future_price,
+            "profit": round(profit, 2),
+            "balance_after": round(balance, 2),
+        })
+        
+        i += TRADE_HOLDING_PERIOD_CANDLES + step_size
+    
+    total_trades = winning + losing
+    winrate = (winning / total_trades * 100) if total_trades > 0 else 0
+    
+    return {
+        "winning": winning,
+        "losing": losing,
+        "profit": total_profit,
+        "loss": total_loss,
+        "final_balance": balance,
+        "equity_curve": equity_curve,
+        "returns": returns,
+        "trades": trades,
+        "trades_count": total_trades,
+        "winrate": winrate,
+    }
+
+
+def _run_simple_backtest(
+    closes: list,
+    volumes: list,
+    min_confidence: int,
+    trade_size_pct: float,
+    config: dict | None,
+) -> BacktestResult:
+    """Fallback simple backtest when data is insufficient for WFO.
+    
+    Args:
+        closes: Price data.
+        volumes: Volume data.
+        min_confidence: Minimum confidence threshold.
+        trade_size_pct: Trade size percentage.
+        config: Optional configuration.
+    
+    Returns:
+        BacktestResult object.
+    """
+    result = BacktestResult()
+    result.run_timestamp = datetime.now(timezone.utc).isoformat()
+    result.data_points = len(closes)
+    
+    balance = BACKTEST_INITIAL_BALANCE
+    equity_curve = [balance]
+    peak_balance = balance
+    max_drawdown = 0.0
+    returns = []
+    
+    min_window = 40
+    step_size = max(1, (len(closes) - min_window) // 200)
+    
+    i = min_window
+    while i < len(closes) - TRADE_HOLDING_PERIOD_CANDLES:
+        window_closes = closes[max(0, i - 100):i]
+        window_volumes = volumes[max(0, i - 100):i] if volumes else None
+        
+        if len(window_closes) < min_window:
+            i += step_size
+            continue
+        
+        conf_result = calculate_confidence_backtest(window_closes, config, window_volumes)
+        direction = conf_result["direction"]
+        confidence = conf_result["confidence_score"]
+        
+        if direction == "hold" or confidence < min_confidence:
+            i += step_size
+            continue
+        
+        current_price = closes[i]
+        future_price = closes[i + TRADE_HOLDING_PERIOD_CANDLES]
+        
+        price_change_pct = ((future_price - current_price) / current_price) * 100
+        trade_size = balance * trade_size_pct
+        
+        if direction == "up":
+            profit = trade_size * (price_change_pct / 100)
+        else:
+            profit = trade_size * (-price_change_pct / 100)
+        
         if profit > 0:
             result.winning_trades += 1
             result.total_profit += profit
         else:
             result.losing_trades += 1
-            result.total_loss += profit  # profit is negative here
+            result.total_loss += profit
         
-        # Update balance
+        prev_balance = balance
         balance += profit
         equity_curve.append(balance)
         
-        # Track return for Sharpe ratio
-        if equity_curve[-2] > 0:
-            trade_return = (balance - equity_curve[-2]) / equity_curve[-2]
-            returns.append(trade_return)
+        if prev_balance > 0:
+            returns.append((balance - prev_balance) / prev_balance)
         
-        # Track drawdown
         if balance > peak_balance:
             peak_balance = balance
-        current_drawdown = ((peak_balance - balance) / peak_balance) * 100 if peak_balance > 0 else 0
-        max_drawdown = max(max_drawdown, current_drawdown)
+        current_dd = ((peak_balance - balance) / peak_balance) * 100 if peak_balance > 0 else 0
+        max_drawdown = max(max_drawdown, current_dd)
         
-        # Record trade
         result.trades.append({
             "index": i,
             "direction": direction,
@@ -711,34 +1341,17 @@ def run_backtest(
             "balance_after": round(balance, 2),
         })
         
-        trades_count += 1
-        
-        # Move forward (skip the lookahead period to avoid overlapping trades)
-        i += lookahead + step_size
+        i += TRADE_HOLDING_PERIOD_CANDLES + step_size
     
-    # Finalize results
     result.final_balance = balance
     result.equity_curve = equity_curve
     result.max_drawdown = max_drawdown
     
-    # Calculate Sharpe Ratio
     if len(returns) > 1:
         mean_return = np.mean(returns)
         std_return = np.std(returns)
         if std_return > 0:
-            # Annualize using hourly annualization factor (~8760 trades per year)
             result.sharpe_ratio = (mean_return / std_return) * SHARPE_ANNUALIZATION_FACTOR
-        else:
-            result.sharpe_ratio = 0.0
-    else:
-        result.sharpe_ratio = 0.0
-    
-    logger.info(
-        f"Backtest completed: {result.total_trades} trades, "
-        f"Winrate: {result.winrate:.1f}%, "
-        f"Profit Factor: {result.profit_factor:.2f}, "
-        f"Max Drawdown: {result.max_drawdown:.1f}%"
-    )
     
     return result
 
@@ -847,8 +1460,9 @@ def format_backtest_results(result: BacktestResult | dict) -> str:
     else:
         dd_emoji = "⚠️"
     
-    return f"""
-📈 **Backtest Results**
+    # Base results
+    text = f"""
+📈 **Walk-Forward Backtest Results**
 
 **Asset:** {data.get('crypto_id', 'bitcoin').upper()}
 **Data Points:** {data.get('data_points', 0):,}
@@ -870,6 +1484,22 @@ Total Trades: {data.get('total_trades', 0)}
 Gross Profit: ${data.get('total_profit', 0):,.2f}
 Gross Loss: ${data.get('total_loss', 0):,.2f}
 """
+    
+    # Add WFO optimized parameters if available
+    if data.get("is_walk_forward") and data.get("optimized_params"):
+        params = data["optimized_params"]
+        text += f"""
+🔧 **Optimierte Parameter:**
+• Short Window: {params.get('short_window', 5)}
+• Long Window: {params.get('long_window', 20)}
+• RSI Overbought: {params.get('rsi_overbought', 70)}
+• RSI Oversold: {params.get('rsi_oversold', 30)}
+• Volume Momentum: {VOLUME_MOMENTUM_WEIGHT}% Gewicht
+
+_Parameter wurden in bot_config.json gespeichert._
+"""
+    
+    return text
 
 
 def format_live_vs_backtest_comparison(live_pnl: dict, backtest: dict | None) -> str:
