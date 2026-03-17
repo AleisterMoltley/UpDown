@@ -146,6 +146,13 @@ stop_event = threading.Event()
 cg = CoinGeckoAPI()
 
 # ---------------------------------------------------------------------------
+# L2 Credentials Cache
+# ---------------------------------------------------------------------------
+# Cache structure: {"api_key": str, "api_secret": str, "api_passphrase": str, "derived_at": float}
+_l2_credentials_cache: dict | None = None
+_L2_CREDENTIALS_TTL_SECONDS = 3600  # 1 hour TTL
+
+# ---------------------------------------------------------------------------
 # Config persistence
 # ---------------------------------------------------------------------------
 
@@ -911,17 +918,74 @@ def get_polygon_balance() -> float:
             return float(balance_info.get("balance", 0) or 0)
         return float(balance_info or 0)
     except Exception as e:
+        # Invalidate cache on authentication errors (401/403)
+        if _is_auth_error(e):
+            invalidate_l2_credentials_cache()
         logger.error(f"Error fetching Polygon balance: {e}")
         return 0.0
 
+
+def _is_l2_credentials_valid() -> bool:
+    """Check if cached L2 credentials are still valid (not expired).
+    
+    Returns:
+        True if credentials exist and are within TTL, False otherwise.
+    """
+    global _l2_credentials_cache
+    if _l2_credentials_cache is None:
+        return False
+    
+    derived_at = _l2_credentials_cache.get("derived_at", 0)
+    elapsed = time.time() - derived_at
+    return elapsed < _L2_CREDENTIALS_TTL_SECONDS
+
+
+def invalidate_l2_credentials_cache() -> None:
+    """Invalidate the L2 credentials cache.
+    
+    Call this function when a 401/403 response is received from the CLOB API
+    to force re-derivation of credentials on the next client build.
+    """
+    global _l2_credentials_cache
+    _l2_credentials_cache = None
+    logger.info("L2-Credentials-Cache invalidiert")
+
+
+def _is_auth_error(exception: Exception) -> bool:
+    """Check if an exception indicates a 401/403 authentication error.
+    
+    Args:
+        exception: The exception to check.
+        
+    Returns:
+        True if the exception indicates an authentication/authorization error.
+    """
+    error_str = str(exception).lower()
+    # Check for common HTTP auth error indicators
+    if "401" in error_str or "403" in error_str:
+        return True
+    if "unauthorized" in error_str or "forbidden" in error_str:
+        return True
+    if "authentication" in error_str or "invalid api" in error_str:
+        return True
+    
+    # Check if exception has response attribute (like requests.HTTPError)
+    if hasattr(exception, "response") and exception.response is not None:
+        status_code = getattr(exception.response, "status_code", None)
+        if status_code in (401, 403):
+            return True
+    
+    return False
 
 def _build_clob_client():
     """Construct a ClobClient im 100% onchain-Modus.
     
     Verwendet nur private_key (EOA signature_type=0).
-    L2-Credentials werden automatisch mit derive_api_key() abgeleitet.
+    L2-Credentials werden aus dem Cache verwendet oder automatisch mit 
+    derive_api_key() abgeleitet und für 1 Stunde gecached.
     Keine gespeicherten API-Creds mehr nötig!
     """
+    global _l2_credentials_cache
     key = bot_config.get("polygon_private_key", "")
     
     if not key:
@@ -935,6 +999,21 @@ def _build_clob_client():
         # Key mit 0x Prefix normalisieren
         key_with_prefix = key if key.startswith("0x") else f"0x{key}"
         
+        # Check if we have valid cached credentials
+        if _is_l2_credentials_valid():
+            logger.debug("Verwende gecachte L2-API-Credentials")
+            return ClobClient(
+                host=bot_config.get("polymarket_host", "https://clob.polymarket.com"),
+                chain_id=bot_config.get("chain_id", 137),
+                key=key_with_prefix,
+                signature_type=0,
+                creds=ApiCreds(
+                    api_key=_l2_credentials_cache["api_key"],
+                    api_secret=_l2_credentials_cache["api_secret"],
+                    api_passphrase=_l2_credentials_cache["api_passphrase"],
+                ),
+            )
+        
         # ClobClient im EOA-Modus erstellen (signature_type=0)
         client = ClobClient(
             host=bot_config.get("polymarket_host", "https://clob.polymarket.com"),
@@ -943,10 +1022,18 @@ def _build_clob_client():
             signature_type=0,  # EOA signature
         )
         
-        # L2-Credentials automatisch ableiten (wie in offiziellen Docs 2026)
+        # L2-Credentials automatisch ableiten und cachen
         try:
             derived_creds = client.derive_api_key()
-            logger.info("L2-API-Credentials erfolgreich abgeleitet")
+            logger.info("L2-API-Credentials erfolgreich abgeleitet und gecached")
+            
+            # Cache the derived credentials
+            _l2_credentials_cache = {
+                "api_key": derived_creds.get("apiKey", ""),
+                "api_secret": derived_creds.get("secret", ""),
+                "api_passphrase": derived_creds.get("passphrase", ""),
+                "derived_at": time.time(),
+            }
             
             # Client mit abgeleiteten Credentials neu erstellen
             client = ClobClient(
@@ -955,9 +1042,9 @@ def _build_clob_client():
                 key=key_with_prefix,
                 signature_type=0,
                 creds=ApiCreds(
-                    api_key=derived_creds.get("apiKey", ""),
-                    api_secret=derived_creds.get("secret", ""),
-                    api_passphrase=derived_creds.get("passphrase", ""),
+                    api_key=_l2_credentials_cache["api_key"],
+                    api_secret=_l2_credentials_cache["api_secret"],
+                    api_passphrase=_l2_credentials_cache["api_passphrase"],
                 ),
             )
         except Exception as e:
@@ -1165,6 +1252,9 @@ def place_trade(market: dict, outcome: str = "yes", amount: float = 10.0) -> dic
 
         return {"success": True, "response": resp, "price": price, "token_id": token_id}
     except Exception as e:
+        # Invalidate cache on authentication errors (401/403)
+        if _is_auth_error(e):
+            invalidate_l2_credentials_cache()
         return {"success": False, "error": str(e)}
 
 
@@ -1322,6 +1412,9 @@ def sell_position(position: dict) -> dict:
         }
 
     except Exception as e:
+        # Invalidate cache on authentication errors (401/403)
+        if _is_auth_error(e):
+            invalidate_l2_credentials_cache()
         return {"success": False, "error": str(e)}
 
 
