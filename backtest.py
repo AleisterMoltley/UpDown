@@ -28,7 +28,14 @@ BACKTEST_TRADES = 1000  # Simulate 1000 trades
 BACKTEST_INITIAL_BALANCE = 1000.0  # Starting balance for simulation
 BACKTEST_TRADE_SIZE_PCT = 0.05  # 5% of balance per trade
 MIN_CONFIDENCE_THRESHOLD = 68  # Minimum confidence to execute trade
-ANNUALIZATION_FACTOR = 365  # For Sharpe ratio calculation
+
+# Trade holding period: 12 candles of 5-min each = ~1 hour
+TRADE_HOLDING_PERIOD_CANDLES = 12
+
+# Annualization factor for Sharpe ratio: sqrt(trades per year)
+# With ~1 hour per trade and 24 hours/day, ~8760 trading opportunities per year
+# Using sqrt(8760) ≈ 93.6 for hourly annualization
+SHARPE_ANNUALIZATION_FACTOR = 93.6
 
 # File path for storing backtest results (same as PNL file for integration)
 BACKTEST_RESULTS_FILE = Path("daily_pnl.json")
@@ -433,8 +440,10 @@ def interpolate_to_5min(hourly_prices: list) -> list:
             price = p1 + (p2 - p1) * fraction
             result.append([timestamp, price])
     
-    # Add final point
-    result.append(hourly_prices[-1])
+    # Add final hourly price point only if it wasn't already included
+    # (The last iteration covers j=0..11, ending at 11/12 of the final interval)
+    if hourly_prices:
+        result.append(hourly_prices[-1])
     
     return result
 
@@ -494,7 +503,7 @@ class BacktestResult:
             "winning_trades": self.winning_trades,
             "losing_trades": self.losing_trades,
             "winrate": round(self.winrate, 2),
-            "profit_factor": round(self.profit_factor, 2) if self.profit_factor != float("inf") else "Inf",
+            "profit_factor": round(self.profit_factor, 2) if self.profit_factor != float("inf") else "∞",
             "total_profit": round(self.total_profit, 2),
             "total_loss": round(self.total_loss, 2),
             "net_profit": round(self.total_profit + self.total_loss, 2),
@@ -555,7 +564,8 @@ def run_backtest(
     min_window = 40
     
     # Step through data simulating trades
-    # Skip by random intervals to simulate realistic trading
+    # Divide by 2 to account for lookahead periods and spacing between trades
+    # This ensures we have room for trade entry, holding period, and gap to next trade
     step_size = max(1, (len(closes) - min_window) // (max_trades * 2))
     
     i = min_window
@@ -580,8 +590,8 @@ def run_backtest(
         # Execute trade
         current_price = closes[i]
         
-        # Look ahead to determine outcome (simulate holding for ~1 hour / 12 candles)
-        lookahead = min(12, len(closes) - i - 1)
+        # Look ahead to determine outcome (holding period defined by constant)
+        lookahead = min(TRADE_HOLDING_PERIOD_CANDLES, len(closes) - i - 1)
         if lookahead <= 0:
             break
         
@@ -648,8 +658,8 @@ def run_backtest(
         mean_return = np.mean(returns)
         std_return = np.std(returns)
         if std_return > 0:
-            # Annualize assuming ~1 hour per trade
-            result.sharpe_ratio = (mean_return / std_return) * np.sqrt(ANNUALIZATION_FACTOR)
+            # Annualize using hourly annualization factor (~8760 trades per year)
+            result.sharpe_ratio = (mean_return / std_return) * SHARPE_ANNUALIZATION_FACTOR
         else:
             result.sharpe_ratio = 0.0
     else:
@@ -832,22 +842,24 @@ def format_live_vs_backtest_comparison(live_pnl: dict, backtest: dict | None) ->
     bt_mdd = backtest.get("max_drawdown", 0)
     bt_sharpe = backtest.get("sharpe_ratio", 0)
     
-    # Format profit factors
+    # Format profit factors (use consistent infinity symbol)
     live_pf_str = f"{live_pf:.2f}" if live_pf != float("inf") else "∞"
-    bt_pf_str = f"{bt_pf:.2f}" if isinstance(bt_pf, (int, float)) else str(bt_pf)
+    bt_pf_str = f"{bt_pf:.2f}" if isinstance(bt_pf, (int, float)) else "∞" if bt_pf == "∞" else str(bt_pf)
     
     # Comparison indicators
     wr_diff = live_winrate - bt_winrate
     wr_indicator = "📈" if wr_diff > 2 else "📉" if wr_diff < -2 else "➡️"
     
+    # Use simple line-by-line format (Telegram doesn't support markdown tables)
     return f"""
 📊 **Live vs Backtest Vergleich:**
 
-| Metrik | Live | Backtest |
-|--------|------|----------|
-| Winrate | {live_winrate:.1f}% | {bt_winrate:.1f}% {wr_indicator}
-| Profit Factor | {live_pf_str} | {bt_pf_str}
-| Trades | {live_total} | {backtest.get('total_trades', 0)}
+**Winrate:**
+  Live: {live_winrate:.1f}% | Backtest: {bt_winrate:.1f}% {wr_indicator}
+**Profit Factor:**
+  Live: {live_pf_str} | Backtest: {bt_pf_str}
+**Trades:**
+  Live: {live_total} | Backtest: {backtest.get('total_trades', 0)}
 
 **Backtest Referenz:**
 Max Drawdown: {bt_mdd:.1f}%
