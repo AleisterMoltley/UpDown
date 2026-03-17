@@ -1450,6 +1450,59 @@ LOGREG_AGREEMENT_BONUS_CAP = 5  # Maximum bonus (%) for LogReg agreement with ma
 # Polymarket deviation scaling
 POLYMARKET_DEVIATION_STRENGTH_SCALE = 5  # Scaling factor: 20% deviation = 100% strength
 
+# Kelly Criterion constants
+KELLY_MAX_FRACTION = 0.15  # Maximum 15% of balance per trade
+KELLY_MIN_TRADE_USD = 3.0  # Minimum $3 per trade
+KELLY_HOUSE_EDGE_BUFFER = 0.03  # Polymarket house edge buffer
+
+
+def kelly_position_size(confidence: float, balance: float, deviation_pct: float = 0.0) -> float:
+    """Calculate optimal position size using Kelly Criterion.
+    
+    The Kelly Criterion determines the optimal fraction of bankroll to bet
+    to maximize long-term growth while minimizing risk of ruin.
+    
+    Formula:
+        edge = abs(deviation_pct / 100) + 0.03 (Polymarket house edge buffer)
+        fraction = (confidence/100 * 2 - 1) * edge
+    
+    Constraints:
+        - Maximum 15% of balance per trade
+        - Minimum $3 per trade
+    
+    Args:
+        confidence: Confidence level (0-100) from multi-signal engine
+        balance: Current USDC balance
+        deviation_pct: Market price deviation percentage from scanner (default 0)
+    
+    Returns:
+        Optimal trade amount in USD, constrained to [min_trade, max_position]
+    """
+    # Calculate edge: deviation percentage + house edge buffer
+    edge = abs(deviation_pct / 100) + KELLY_HOUSE_EDGE_BUFFER
+    
+    # Kelly formula: fraction = (win_prob * 2 - 1) * edge
+    # Where win_prob is confidence/100
+    win_prob = confidence / 100.0
+    kelly_fraction = (win_prob * 2 - 1) * edge
+    
+    # Kelly can be negative if confidence < 50% (indicating a losing bet)
+    # In that case, we should not bet at all
+    if kelly_fraction <= 0:
+        return KELLY_MIN_TRADE_USD  # Return minimum trade size
+    
+    # Cap at maximum fraction (15% of balance)
+    kelly_fraction = min(kelly_fraction, KELLY_MAX_FRACTION)
+    
+    # Calculate position size
+    position_size = balance * kelly_fraction
+    
+    # Apply constraints: min $3, max 15% of balance
+    max_position = balance * KELLY_MAX_FRACTION
+    position_size = max(KELLY_MIN_TRADE_USD, min(position_size, max_position))
+    
+    return round(position_size, 2)
+
 
 def sigmoid(x: float) -> float:
     """Compute sigmoid function with overflow protection.
@@ -3334,6 +3387,16 @@ def bot_loop(send_notification):
 
                 if bot_config.get("dry_run", True):
                     outcome = "YES" if prediction == "up" else "NO"
+                    # Calculate Kelly size for dry run display
+                    current_balance = get_polygon_balance()
+                    kelly_size = kelly_position_size(
+                        confidence=total_confidence,
+                        balance=current_balance,
+                        deviation_pct=deviation_pct,
+                    )
+                    # Update config with Kelly size even in dry run
+                    bot_config["trade_amount"] = kelly_size
+                    
                     logger.info(f"[Dry run] Would buy {outcome} on {market.get('question')}")
                     send_notification(
                         f"📊 **Dry Run Trade**\n"
@@ -3343,7 +3406,8 @@ def bot_loop(send_notification):
                         f"Base Confidence: {confidence:.1f}%\n"
                         f"📈 Deviation: {deviation_pct:.1f}% ({direction})\n"
                         f"🎯 Total Confidence: {total_confidence:.1f}%\n"
-                        f"Would buy: {outcome}\n\n"
+                        f"Would buy: {outcome}\n"
+                        f"💰 Kelly Size: ${kelly_size:.2f} (Balance: ${current_balance:.2f})\n\n"
                         f"📊 **Market Data:**\n"
                         f"• Current Price: {current_price:.2%}\n"
                         f"• Historical Mean: {historical_mean:.2%}\n\n"
@@ -3359,7 +3423,18 @@ def bot_loop(send_notification):
                     )
                 else:
                     outcome = "yes" if prediction == "up" else "no"
-                    trade_amount = bot_config.get("trade_amount", 5.0)
+                    
+                    # Calculate Kelly-optimized position size
+                    current_balance = get_polygon_balance()
+                    kelly_size = kelly_position_size(
+                        confidence=total_confidence,
+                        balance=current_balance,
+                        deviation_pct=deviation_pct,
+                    )
+                    # Store Kelly-calculated size in config (overrides fixed value)
+                    bot_config["trade_amount"] = kelly_size
+                    trade_amount = kelly_size
+                    
                     result = place_trade(
                         market,
                         outcome=outcome,
@@ -3376,7 +3451,7 @@ def bot_loop(send_notification):
                             f"Base Confidence: {confidence:.1f}%\n"
                             f"📈 Deviation: {deviation_pct:.1f}% ({direction})\n"
                             f"🎯 Total Confidence: {total_confidence:.1f}%\n"
-                            f"Amount: ${trade_amount}\n"
+                            f"💰 Kelly Size: ${trade_amount:.2f} (Balance: ${current_balance:.2f})\n"
                             f"Price: {result.get('price', 'N/A')}"
                             f"{logreg_text}"
                         )
@@ -4991,6 +5066,16 @@ async def trade_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     deviation_bonus = min(15.0, deviation_pct / 2.0)
     total_confidence = min(100.0, base_confidence + deviation_bonus)
 
+    # Calculate Kelly-optimized position size
+    current_balance = get_polygon_balance()
+    kelly_size = kelly_position_size(
+        confidence=total_confidence,
+        balance=current_balance,
+        deviation_pct=deviation_pct,
+    )
+    # Store Kelly-calculated size in config (overrides fixed value)
+    bot_config["trade_amount"] = kelly_size
+
     keyboard = [
         [
             InlineKeyboardButton("Buy YES", callback_data="trade_yes"),
@@ -5018,7 +5103,7 @@ async def trade_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"• 🎯 Total: {total_confidence:.1f}%\n\n"
         f"**Trade:**\n"
         f"• Prediction suggests: {outcome}\n"
-        f"• Amount: ${bot_config.get('trade_amount', 5.0)}\n\n"
+        f"• 💰 Kelly Size: ${kelly_size:.2f} (Balance: ${current_balance:.2f})\n\n"
         f"Select your trade:",
         reply_markup=reply_markup,
         parse_mode="Markdown",
