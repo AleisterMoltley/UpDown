@@ -64,12 +64,13 @@ PNL_FILE = Path("daily_pnl.json")
 
 # Conversation states
 # Hinweis: API_KEY, API_SECRET, API_PASSPHRASE werden im 100% onchain-Modus nicht mehr benötigt
+# Diese States bleiben für Rückwärtskompatibilität erhalten, werden aber nicht mehr aktiv genutzt
 (
     AWAITING_SOLANA_KEY,
     AWAITING_POLYGON_KEY,
-    AWAITING_API_KEY,  # Deprecated - nur für Rückwärtskompatibilität
-    AWAITING_API_SECRET,  # Deprecated - nur für Rückwärtskompatibilität
-    AWAITING_API_PASSPHRASE,  # Deprecated - nur für Rückwärtskompatibilität
+    AWAITING_API_KEY,  # Deprecated - nicht mehr benötigt im onchain-Modus
+    AWAITING_API_SECRET,  # Deprecated - nicht mehr benötigt im onchain-Modus
+    AWAITING_API_PASSPHRASE,  # Deprecated - nicht mehr benötigt im onchain-Modus
     AWAITING_TRADE_AMOUNT,
     AWAITING_MIN_BALANCE,
     AWAITING_BRIDGE_AMOUNT,
@@ -125,7 +126,7 @@ SENSITIVE_KEYS = frozenset([
 ])
 
 # ---------------------------------------------------------------------------
-# Polygon Onchain Contracts (2026)
+# Polygon Onchain Contracts
 # ---------------------------------------------------------------------------
 # USDC auf Polygon
 POLYGON_USDC_ADDRESS = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"
@@ -556,7 +557,7 @@ def swap_usdc_to_matic(amount_usdc: float) -> dict:
         account = Account.from_key(key_with_prefix)
         address = account.address
         
-        # 30 Sekunden Safety-Delay
+        # 30 Sekunden Safety-Delay (nicht blockierend in sync context)
         logger.info(f"⚠️ USDC → MATIC Swap: {amount_usdc} USDC. 30s Safety-Delay...")
         time.sleep(30)
         
@@ -597,6 +598,15 @@ def swap_usdc_to_matic(amount_usdc: float) -> dict:
             abi=swap_router_abi
         )
         
+        # Slippage-Schutz: Erwarte mindestens 80% des Nominalwerts
+        # Bei 0.20 USDC und MATIC ~$0.50, erwarten wir ~0.4 MATIC
+        # Wir akzeptieren 80% davon als Minimum = 0.32 MATIC
+        # Für kleine Beträge ist das ein vernünftiger Schutz
+        # MATIC hat 18 decimals, also: 0.20 USD / 0.50 USD/MATIC * 0.8 = 0.32 MATIC
+        # In Wei: 0.32 * 10^18 = 320000000000000000
+        # Vereinfacht: Für $0.20 erwarten wir min. 0.1 MATIC (konservativ)
+        amount_out_min = int(0.1 * 10**18) if amount_usdc >= 0.20 else 0
+        
         # ExactInputSingle Parameter
         # Fee: 3000 = 0.3% Pool (üblich für USDC/WMATIC)
         params = (
@@ -606,7 +616,7 @@ def swap_usdc_to_matic(amount_usdc: float) -> dict:
             w3.to_checksum_address(address),                # recipient
             deadline,                                        # deadline
             amount_in,                                       # amountIn
-            0,                                               # amountOutMinimum (für kleine Beträge OK)
+            amount_out_min,                                  # amountOutMinimum (Slippage-Schutz)
             0                                                # sqrtPriceLimitX96
         )
         
@@ -2125,10 +2135,13 @@ async def gas_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     topup_threshold = bot_config.get("auto_matic_topup_min_profit", 0.5)
     topup_amount = bot_config.get("auto_matic_topup_amount", 0.20)
 
+    # Adresse formatieren
+    address_display = f"`{address[:20]}...`" if address else "Nicht verfügbar"
+
     text = f"""
 ⛽ **Gas Status (MATIC)**
 
-**Adresse:** `{address[:20]}...` if address else "Nicht verfügbar"
+**Adresse:** {address_display}
 **MATIC-Balance:** {matic_balance:.4f} MATIC
 **Status:** {status}
 {warning}

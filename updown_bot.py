@@ -9,7 +9,7 @@ Polymarket CLOB client.
 Includes Solana wallet integration for automatic funding of Polygon balance
 when trading balance is low.
 
-100% Onchain-Modus (2026):
+100% Onchain-Modus:
     - Keine API-Credentials mehr benötigt
     - L2-Credentials werden automatisch abgeleitet
     - Nur noch POLYMARKET_PRIVATE_KEY erforderlich
