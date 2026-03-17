@@ -40,6 +40,14 @@ from telegram.ext import (
     filters,
 )
 
+# Import market scanner module
+from market_scanner import (
+    format_scan_results,
+    get_category_summary,
+    get_top_mispriced_markets,
+    scan_all_markets,
+)
+
 # Load environment variables from .env file
 load_dotenv()
 
@@ -2367,6 +2375,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 /balance - Alle Balances anzeigen
 /predict - Multi-Signal Vorhersage anzeigen 📈
 /markets - Relevante Märkte finden
+/scan - Alle Märkte scannen 🔎 (Top 5 Mispriced)
 /trade - Manueller Trade
 /bridge - Solana→Polygon Bridge
 
@@ -2600,6 +2609,59 @@ async def markets_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         text += f"   ID: `{market.get('id', 'N/A')[:20]}...`\n\n"
 
     await update.message.reply_text(text, parse_mode="Markdown")
+
+
+async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /scan command - Scan ALL active markets for mispriced opportunities.
+
+    This command fetches all active Polymarket markets with volume > $10k,
+    categorizes them, and identifies the top 5 markets where current price
+    deviates significantly from historical mean.
+    """
+    if not is_authorized(update):
+        await unauthorized_response(update)
+        return
+
+    await update.message.reply_text("🔍 Scanning all active markets... This may take a moment.")
+
+    try:
+        # Get top 5 mispriced markets with minimum 10% deviation
+        mispriced = get_top_mispriced_markets(count=5, min_deviation_pct=5.0)
+
+        if not mispriced:
+            # If no mispriced markets found, show category summary
+            all_markets = scan_all_markets()
+            summary = get_category_summary(all_markets)
+
+            text = "📊 **Market Scan Complete**\n\n"
+            text += "No significantly mispriced markets found.\n\n"
+            text += "**Markets by Category:**\n"
+            for cat, count in sorted(summary.items(), key=lambda x: -x[1]):
+                text += f"• {cat.capitalize()}: {count}\n"
+            text += f"\n**Total:** {len(all_markets)} active markets (volume > $10k)"
+
+            await update.message.reply_text(text, parse_mode="Markdown")
+            return
+
+        # Format and send results
+        result_text = format_scan_results(mispriced)
+
+        # Add category summary at the end
+        all_markets = scan_all_markets()
+        summary = get_category_summary(all_markets)
+        result_text += "\n\n**📊 All Markets by Category:**\n"
+        for cat, count in sorted(summary.items(), key=lambda x: -x[1]):
+            result_text += f"• {cat.capitalize()}: {count}\n"
+        result_text += f"\n**Total:** {len(all_markets)} active markets"
+
+        await update.message.reply_text(result_text, parse_mode="Markdown")
+
+    except Exception as e:
+        logger.error(f"Error in scan_command: {e}")
+        await update.message.reply_text(
+            f"❌ Error scanning markets: {str(e)[:100]}",
+            parse_mode="Markdown",
+        )
 
 
 async def pnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4090,6 +4152,7 @@ def main() -> None:
     application.add_handler(CommandHandler("balance", balance_command))
     application.add_handler(CommandHandler("predict", predict_command))
     application.add_handler(CommandHandler("markets", markets_command))
+    application.add_handler(CommandHandler("scan", scan_command))
     application.add_handler(CommandHandler("pnl", pnl_command))
     application.add_handler(CommandHandler("positions", positions_command))
     application.add_handler(CommandHandler("config", config_command))
