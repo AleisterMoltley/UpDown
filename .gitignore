@@ -25,6 +25,7 @@ bot_config.json
 # Runtime data
 daily_pnl.json
 positions.json
+risk_state.json
 
 # IDE / OS
 .idea/
