@@ -42,6 +42,7 @@ KELLY_AVG_WIN_PCT = 0.07  # 7% average win from backtest
 KELLY_AVG_LOSS_PCT = 0.04  # 4% average loss from backtest
 KELLY_MAX_FRACTION = 0.25  # Maximum 25% Kelly fraction
 KELLY_MIN_TRADE_USD = 3.0  # Minimum $3 per trade
+KELLY_SLIPPAGE_BUFFER = 0.005  # 0.5% slippage buffer for edge calculation
 
 # Walk-Forward Optimization constants
 WFO_NUM_TRAINING_WINDOWS = 5  # 5 training windows
@@ -436,11 +437,11 @@ def calc_kelly_size(
             - kelly_fraction: Kelly fraction (before capping)
     """
     # Calculate edge using backtest-derived average win/loss percentages
-    # edge = (win_prob * avg_win) - (loss_prob * avg_loss)
+    # edge = (win_prob * avg_win) - (loss_prob * avg_loss) - slippage_buffer
     win_prob = confidence / 100.0
     loss_prob = 1.0 - win_prob
     
-    edge = (win_prob * KELLY_AVG_WIN_PCT) - (loss_prob * KELLY_AVG_LOSS_PCT)
+    edge = (win_prob * KELLY_AVG_WIN_PCT) - (loss_prob * KELLY_AVG_LOSS_PCT) - KELLY_SLIPPAGE_BUFFER
     edge_pct = edge * 100  # Convert to percentage for logging
     
     # Kelly fraction = edge / avg_win (capped at max 25%)
