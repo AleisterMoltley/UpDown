@@ -75,7 +75,11 @@ POSITIONS_FILE = Path("positions.json")
     AWAITING_MANUAL_TRADE_MARKET,
     AWAITING_MANUAL_TRADE_SIDE,
     AWAITING_MANUAL_TRADE_AMOUNT,
-) = range(9)
+    AWAITING_CONFIDENCE_THRESHOLD,
+    AWAITING_RSI_PERIOD,
+    AWAITING_MACD_PARAMS,
+    AWAITING_RSI_THRESHOLDS,
+) = range(13)
 
 # Default configuration
 # 100% Onchain-Modus: Keine API-Credentials mehr benötigt, nur private_key
@@ -104,6 +108,20 @@ DEFAULT_CONFIG = {
     "auto_matic_topup_enabled": True,
     "auto_matic_topup_min_profit": 0.5,  # Minimum Profit in USD für Top-Up
     "auto_matic_topup_amount": 0.20,  # USDC → MATIC Swap-Betrag
+    # Multi-Signal Trading Engine Settings
+    "min_confidence_threshold": 70,  # Minimum confidence (0-100) to execute trades
+    "rsi_period": 14,  # RSI calculation period
+    "macd_fast_period": 12,  # MACD fast EMA period
+    "macd_slow_period": 26,  # MACD slow EMA period
+    "macd_signal_period": 9,  # MACD signal line period
+    "signal_weights": {
+        "ma_crossover": 30,  # Weight for MA crossover signal
+        "rsi": 30,  # Weight for RSI signal
+        "macd": 25,  # Weight for MACD signal
+        "polymarket_delta": 15,  # Weight for Polymarket price delta
+    },
+    "rsi_overbought": 70,  # RSI overbought threshold
+    "rsi_oversold": 30,  # RSI oversold threshold
 }
 
 # Solana USDC token mint address (mainnet)
@@ -1119,8 +1137,430 @@ def fetch_5min_data(crypto_id: str = "bitcoin", max_retries: int = 3) -> list:
     raise ConnectionError(error_msg) from last_error
 
 
+# ---------------------------------------------------------------------------
+# Multi-Signal Trading Engine
+# ---------------------------------------------------------------------------
+
+
+def calculate_ema(prices: list, period: int) -> list:
+    """Calculate Exponential Moving Average (EMA).
+    
+    Args:
+        prices: List of price values.
+        period: EMA period.
+    
+    Returns:
+        List of EMA values (same length as prices, with NaN for early values).
+    """
+    if len(prices) < period:
+        return []
+    
+    multiplier = 2 / (period + 1)
+    ema = [sum(prices[:period]) / period]  # Start with SMA
+    
+    for price in prices[period:]:
+        ema.append((price - ema[-1]) * multiplier + ema[-1])
+    
+    return ema
+
+
+def calculate_rsi(closes: list, period: int | None = None) -> float:
+    """Calculate Relative Strength Index (RSI).
+    
+    Args:
+        closes: List of closing prices.
+        period: RSI period (default from config, typically 14).
+    
+    Returns:
+        RSI value (0-100), or 50 if insufficient data.
+    """
+    if period is None:
+        period = bot_config.get("rsi_period", 14)
+    
+    if len(closes) < period + 1:
+        return 50.0  # Neutral value if insufficient data
+    
+    # Calculate price changes
+    changes = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+    
+    # Separate gains and losses
+    gains = [max(0, change) for change in changes]
+    losses = [max(0, -change) for change in changes]
+    
+    # Calculate average gain and loss using EMA
+    recent_gains = gains[-(period):]
+    recent_losses = losses[-(period):]
+    
+    avg_gain = sum(recent_gains) / period
+    avg_loss = sum(recent_losses) / period
+    
+    if avg_loss == 0:
+        return 100.0 if avg_gain > 0 else 50.0
+    
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+    
+    return rsi
+
+
+def calculate_macd(closes: list) -> dict:
+    """Calculate MACD (Moving Average Convergence Divergence).
+    
+    Returns:
+        Dictionary with:
+        - macd_line: MACD line value
+        - signal_line: Signal line value  
+        - histogram: MACD histogram (macd_line - signal_line)
+        - valid: Whether calculation was successful
+    """
+    fast_period = bot_config.get("macd_fast_period", 12)
+    slow_period = bot_config.get("macd_slow_period", 26)
+    signal_period = bot_config.get("macd_signal_period", 9)
+    
+    if len(closes) < slow_period + signal_period:
+        return {"macd_line": 0, "signal_line": 0, "histogram": 0, "valid": False}
+    
+    # Calculate fast and slow EMAs
+    fast_ema = calculate_ema(closes, fast_period)
+    slow_ema = calculate_ema(closes, slow_period)
+    
+    if not fast_ema or not slow_ema:
+        return {"macd_line": 0, "signal_line": 0, "histogram": 0, "valid": False}
+    
+    # Align EMAs (slow_ema starts later)
+    offset = slow_period - fast_period
+    fast_ema_aligned = fast_ema[offset:]
+    
+    # MACD line = Fast EMA - Slow EMA
+    macd_line_values = [f - s for f, s in zip(fast_ema_aligned, slow_ema)]
+    
+    if len(macd_line_values) < signal_period:
+        return {"macd_line": 0, "signal_line": 0, "histogram": 0, "valid": False}
+    
+    # Signal line = EMA of MACD line
+    signal_ema = calculate_ema(macd_line_values, signal_period)
+    
+    if not signal_ema:
+        return {"macd_line": macd_line_values[-1], "signal_line": 0, "histogram": 0, "valid": False}
+    
+    macd_line = macd_line_values[-1]
+    signal_line = signal_ema[-1]
+    histogram = macd_line - signal_line
+    
+    return {
+        "macd_line": macd_line,
+        "signal_line": signal_line,
+        "histogram": histogram,
+        "valid": True,
+    }
+
+
+def get_polymarket_price_delta(market: dict | None = None) -> dict:
+    """Calculate price delta between market price and fair value.
+    
+    Compares current Polymarket YES token price against the fair value
+    implied by our technical signals.
+    
+    Args:
+        market: Optional market dict. If None, searches for relevant market.
+    
+    Returns:
+        Dictionary with:
+        - market_price: Current YES token price (0-1)
+        - fair_value: Our estimated fair value (0-1)
+        - delta: Difference (positive = undervalued for YES)
+        - valid: Whether calculation was successful
+    """
+    try:
+        if market is None:
+            markets = find_relevant_markets()
+            if not markets:
+                return {"market_price": 0.5, "fair_value": 0.5, "delta": 0, "valid": False}
+            market = markets[0]
+        
+        # Get current market price for YES token
+        tokens = market.get("tokens", [])
+        yes_price = 0.5
+        for token in tokens:
+            if token.get("outcome", "").lower() == "yes":
+                yes_price = float(token.get("price", 0.5))
+                break
+        
+        # Fair value is estimated later based on signals
+        # For now, return just the market price
+        return {
+            "market_price": yes_price,
+            "fair_value": 0.5,  # Will be updated by confidence calculation
+            "delta": 0,
+            "valid": True,
+        }
+    except Exception as e:
+        logger.error(f"Error getting Polymarket price delta: {e}")
+        return {"market_price": 0.5, "fair_value": 0.5, "delta": 0, "valid": False}
+
+
+def calculate_ma_crossover_signal(closes: list) -> dict:
+    """Calculate MA crossover signal strength.
+    
+    Returns:
+        Dictionary with:
+        - direction: 'up', 'down', or 'neutral'
+        - strength: Signal strength (0-100)
+        - ma_short: Short MA value
+        - ma_long: Long MA value
+    """
+    short_window = bot_config.get("short_window", 5)
+    long_window = bot_config.get("long_window", 20)
+    
+    if len(closes) < long_window:
+        return {"direction": "neutral", "strength": 0, "ma_short": 0, "ma_long": 0}
+    
+    ma_short = sum(closes[-short_window:]) / short_window
+    ma_long = sum(closes[-long_window:]) / long_window
+    
+    # Calculate percentage difference
+    if ma_long == 0:
+        return {"direction": "neutral", "strength": 0, "ma_short": ma_short, "ma_long": ma_long}
+    
+    pct_diff = ((ma_short - ma_long) / ma_long) * 100
+    
+    # Convert to strength (0-100), with max strength at +/- 2% difference
+    strength = min(100, abs(pct_diff) * 50)
+    direction = "up" if ma_short > ma_long else "down"
+    
+    return {
+        "direction": direction,
+        "strength": strength,
+        "ma_short": ma_short,
+        "ma_long": ma_long,
+    }
+
+
+def calculate_rsi_signal(closes: list) -> dict:
+    """Calculate RSI-based signal strength.
+    
+    Returns:
+        Dictionary with:
+        - direction: 'up' (oversold), 'down' (overbought), or 'neutral'
+        - strength: Signal strength (0-100)
+        - rsi: Raw RSI value
+    """
+    rsi = calculate_rsi(closes)
+    overbought = bot_config.get("rsi_overbought", 70)
+    oversold = bot_config.get("rsi_oversold", 30)
+    
+    if rsi <= oversold:
+        # Oversold = bullish signal
+        direction = "up"
+        # Strength increases as RSI approaches 0
+        strength = ((oversold - rsi) / oversold) * 100
+    elif rsi >= overbought:
+        # Overbought = bearish signal
+        direction = "down"
+        # Strength increases as RSI approaches 100
+        strength = ((rsi - overbought) / (100 - overbought)) * 100
+    else:
+        # Neutral zone
+        direction = "neutral"
+        # Small strength based on distance from 50
+        strength = abs(rsi - 50) / 20 * 100
+        strength = min(30, strength)  # Cap neutral strength at 30
+    
+    return {
+        "direction": direction,
+        "strength": min(100, strength),
+        "rsi": rsi,
+    }
+
+
+def calculate_macd_signal(closes: list) -> dict:
+    """Calculate MACD-based signal strength.
+    
+    Returns:
+        Dictionary with:
+        - direction: 'up', 'down', or 'neutral'
+        - strength: Signal strength (0-100)
+        - histogram: MACD histogram value
+        - macd_line: MACD line value
+        - signal_line: Signal line value
+    """
+    macd = calculate_macd(closes)
+    
+    if not macd.get("valid"):
+        return {
+            "direction": "neutral",
+            "strength": 0,
+            "histogram": 0,
+            "macd_line": 0,
+            "signal_line": 0,
+        }
+    
+    histogram = macd["histogram"]
+    macd_line = macd["macd_line"]
+    signal_line = macd["signal_line"]
+    
+    # Direction based on histogram
+    if histogram > 0:
+        direction = "up"
+    elif histogram < 0:
+        direction = "down"
+    else:
+        direction = "neutral"
+    
+    # Strength based on histogram magnitude
+    # Normalize: typical BTC histogram might be in range -500 to 500
+    current_price = closes[-1] if closes else 1
+    normalized_histogram = abs(histogram) / current_price * 10000
+    strength = min(100, normalized_histogram * 10)
+    
+    return {
+        "direction": direction,
+        "strength": strength,
+        "histogram": histogram,
+        "macd_line": macd_line,
+        "signal_line": signal_line,
+    }
+
+
+def calculate_polymarket_delta_signal(market_price: float, fair_value: float) -> dict:
+    """Calculate signal from Polymarket price vs fair value.
+    
+    Args:
+        market_price: Current YES token price (0-1)
+        fair_value: Our estimated fair value (0-1)
+    
+    Returns:
+        Dictionary with:
+        - direction: 'up' if undervalued, 'down' if overvalued
+        - strength: Signal strength (0-100)
+        - delta: Price difference
+    """
+    delta = fair_value - market_price
+    
+    # Direction: positive delta means market is undervalued (buy YES)
+    if delta > 0.02:
+        direction = "up"
+    elif delta < -0.02:
+        direction = "down"
+    else:
+        direction = "neutral"
+    
+    # Strength based on delta magnitude (max at 20% difference)
+    strength = min(100, abs(delta) * 500)
+    
+    return {
+        "direction": direction,
+        "strength": strength,
+        "delta": delta,
+    }
+
+
+def calculate_confidence_score(closes: list, market: dict | None = None) -> dict:
+    """Calculate overall confidence score combining all signals.
+    
+    Args:
+        closes: List of closing prices.
+        market: Optional Polymarket market for price delta.
+    
+    Returns:
+        Dictionary with:
+        - prediction: 'up', 'down', or 'hold'
+        - confidence: Overall confidence score (0-100)
+        - signals: Individual signal details
+        - fair_value: Estimated fair value for YES token
+    """
+    weights = bot_config.get("signal_weights", {
+        "ma_crossover": 30,
+        "rsi": 30,
+        "macd": 25,
+        "polymarket_delta": 15,
+    })
+    
+    # Calculate individual signals
+    ma_signal = calculate_ma_crossover_signal(closes)
+    rsi_signal = calculate_rsi_signal(closes)
+    macd_signal = calculate_macd_signal(closes)
+    
+    # Determine overall direction from weighted votes
+    up_score = 0
+    down_score = 0
+    total_weight = 0
+    
+    for signal_name, signal in [("ma_crossover", ma_signal), ("rsi", rsi_signal), ("macd", macd_signal)]:
+        weight = weights.get(signal_name, 25)
+        total_weight += weight
+        
+        if signal["direction"] == "up":
+            up_score += weight * (signal["strength"] / 100)
+        elif signal["direction"] == "down":
+            down_score += weight * (signal["strength"] / 100)
+    
+    # Calculate fair value for Polymarket (0-1 scale)
+    # Higher up_score = higher fair value for YES
+    technical_fair_value = 0.5 + (up_score - down_score) / (total_weight * 2)
+    technical_fair_value = max(0.1, min(0.9, technical_fair_value))  # Clamp to reasonable range
+    
+    # Get Polymarket price delta
+    polymarket_data = get_polymarket_price_delta(market)
+    polymarket_data["fair_value"] = technical_fair_value
+    polymarket_data["delta"] = technical_fair_value - polymarket_data["market_price"]
+    
+    polymarket_signal = calculate_polymarket_delta_signal(
+        polymarket_data["market_price"],
+        technical_fair_value
+    )
+    
+    # Add Polymarket delta to scores
+    polymarket_weight = weights.get("polymarket_delta", 15)
+    total_weight += polymarket_weight
+    
+    if polymarket_signal["direction"] == "up":
+        up_score += polymarket_weight * (polymarket_signal["strength"] / 100)
+    elif polymarket_signal["direction"] == "down":
+        down_score += polymarket_weight * (polymarket_signal["strength"] / 100)
+    
+    # Determine final prediction
+    if up_score > down_score:
+        prediction = "up"
+        confidence = (up_score / total_weight) * 100
+    elif down_score > up_score:
+        prediction = "down"
+        confidence = (down_score / total_weight) * 100
+    else:
+        prediction = "hold"
+        confidence = 0
+    
+    # Adjust confidence based on signal agreement
+    directions = [ma_signal["direction"], rsi_signal["direction"], macd_signal["direction"]]
+    agreement_count = sum(1 for d in directions if d == prediction)
+    
+    # Bonus for signal agreement (up to 20% bonus for all signals agreeing)
+    if agreement_count >= 2:
+        agreement_bonus = (agreement_count - 1) * 10
+        confidence = min(100, confidence + agreement_bonus)
+    
+    return {
+        "prediction": prediction,
+        "confidence": round(confidence, 1),
+        "signals": {
+            "ma_crossover": ma_signal,
+            "rsi": rsi_signal,
+            "macd": macd_signal,
+            "polymarket_delta": polymarket_signal,
+        },
+        "fair_value": technical_fair_value,
+        "polymarket_price": polymarket_data["market_price"],
+        "up_score": up_score,
+        "down_score": down_score,
+    }
+
+
 def predict_up_down(closes: list) -> str:
-    """Predict the next price direction using a moving-average crossover."""
+    """Predict the next price direction using a moving-average crossover.
+    
+    Note: This is the legacy function for backward compatibility.
+    Use calculate_confidence_score() for the new multi-signal engine.
+    """
     short_window = bot_config.get("short_window", 5)
     long_window = bot_config.get("long_window", 20)
 
@@ -1134,35 +1574,54 @@ def predict_up_down(closes: list) -> str:
 
 
 def get_current_prediction() -> dict:
-    """Get current prediction with price data.
+    """Get current prediction with price data using multi-signal engine.
 
     Returns:
         Dictionary with prediction info:
         - prediction: 'up', 'down', 'hold', 'error', or 'unavailable'
+        - confidence: Confidence score (0-100)
         - price: Current price (0 on error)
         - candles: Number of candles fetched
         - crypto: Crypto ID
+        - signals: Individual signal details (ma_crossover, rsi, macd, polymarket_delta)
+        - fair_value: Estimated fair value for YES token
+        - meets_threshold: Whether confidence meets minimum threshold for trading
         - error: Error message (only present on failure)
     """
     try:
         crypto_id = bot_config.get("crypto_id", "bitcoin")
         ohlc = fetch_5min_data(crypto_id=crypto_id)
         closes = [candle[4] for candle in ohlc]
-        prediction = predict_up_down(closes)
         current_price = closes[-1] if closes else 0
+        
+        # Use multi-signal engine for prediction
+        confidence_result = calculate_confidence_score(closes)
+        
+        min_threshold = bot_config.get("min_confidence_threshold", 70)
+        meets_threshold = confidence_result["confidence"] >= min_threshold
+        
         return {
-            "prediction": prediction,
+            "prediction": confidence_result["prediction"],
+            "confidence": confidence_result["confidence"],
             "price": current_price,
             "candles": len(closes),
             "crypto": crypto_id,
+            "signals": confidence_result["signals"],
+            "fair_value": confidence_result["fair_value"],
+            "polymarket_price": confidence_result.get("polymarket_price", 0.5),
+            "meets_threshold": meets_threshold,
+            "min_threshold": min_threshold,
         }
     except ConnectionError as e:
         logger.error(f"Connection error getting prediction: {e}")
         return {
             "prediction": "unavailable",
+            "confidence": 0,
             "price": 0,
             "candles": 0,
             "crypto": bot_config.get("crypto_id", "unknown"),
+            "signals": {},
+            "meets_threshold": False,
             "error": (
                 "Unable to connect to CoinGecko API. "
                 "Verify network connectivity and ensure api.coingecko.com is not blocked by firewall rules."
@@ -1172,9 +1631,12 @@ def get_current_prediction() -> dict:
         logger.error(f"Error getting prediction: {e}")
         return {
             "prediction": "error",
+            "confidence": 0,
             "price": 0,
             "candles": 0,
             "crypto": bot_config.get("crypto_id", "unknown"),
+            "signals": {},
+            "meets_threshold": False,
             "error": str(e),
         }
 
@@ -1662,9 +2124,12 @@ def bot_loop(send_notification):
                 except Exception as e:
                     logger.error(f"Error checking resolved markets: {e}")
 
-            # Get prediction
+            # Get prediction with multi-signal confidence
             pred = get_current_prediction()
             prediction = pred.get("prediction", "hold")
+            confidence = pred.get("confidence", 0)
+            meets_threshold = pred.get("meets_threshold", False)
+            min_threshold = pred.get("min_threshold", 70)
 
             if prediction == "hold":
                 # Skip the cycle but don't update previous_prediction
@@ -1672,6 +2137,13 @@ def bot_loop(send_notification):
                 logger.info("Not enough data - skipping trade")
                 wait_with_check(bot_config.get("cycle_interval_seconds", 300))
                 continue
+
+            # Log signal details
+            signals = pred.get("signals", {})
+            logger.info(
+                f"Prediction: {prediction.upper()} | Confidence: {confidence:.1f}% | "
+                f"Threshold: {min_threshold}% | Trade: {'YES' if meets_threshold else 'NO'}"
+            )
 
             # Check for prediction flip and exit positions if needed
             # Note: Because "hold" states are skipped above, previous_prediction
@@ -1687,6 +2159,25 @@ def bot_loop(send_notification):
 
             previous_prediction = prediction
 
+            # Check if confidence meets threshold for trading
+            if not meets_threshold:
+                logger.info(
+                    f"Confidence {confidence:.1f}% below threshold {min_threshold}% - skipping trade"
+                )
+                # Send notification about skipped trade
+                send_notification(
+                    f"⏸️ **Trade Skipped - Low Confidence**\n\n"
+                    f"Prediction: {prediction.upper()}\n"
+                    f"Confidence: {confidence:.1f}%\n"
+                    f"Required: ≥{min_threshold}%\n\n"
+                    f"📊 **Signals:**\n"
+                    f"• MA: {signals.get('ma_crossover', {}).get('direction', 'N/A').upper()}\n"
+                    f"• RSI: {signals.get('rsi', {}).get('rsi', 0):.1f}\n"
+                    f"• MACD: {signals.get('macd', {}).get('direction', 'N/A').upper()}"
+                )
+                wait_with_check(bot_config.get("cycle_interval_seconds", 300))
+                continue
+
             # Find markets
             markets = find_relevant_markets()
 
@@ -1695,7 +2186,7 @@ def bot_loop(send_notification):
                 wait_with_check(bot_config.get("cycle_interval_seconds", 300))
                 continue
 
-            # Execute trades
+            # Execute trades with confidence
             for market in markets:
                 if bot_config.get("dry_run", True):
                     outcome = "YES" if prediction == "up" else "NO"
@@ -1704,7 +2195,16 @@ def bot_loop(send_notification):
                         f"📊 **Dry Run Trade**\n"
                         f"Market: {market.get('question', 'N/A')[:50]}...\n"
                         f"Prediction: {prediction.upper()}\n"
-                        f"Would buy: {outcome}"
+                        f"Confidence: {confidence:.1f}%\n"
+                        f"Would buy: {outcome}\n\n"
+                        f"📊 **Signals:**\n"
+                        f"• MA: {signals.get('ma_crossover', {}).get('direction', 'N/A').upper()} "
+                        f"({signals.get('ma_crossover', {}).get('strength', 0):.0f}%)\n"
+                        f"• RSI: {signals.get('rsi', {}).get('rsi', 0):.1f} "
+                        f"({signals.get('rsi', {}).get('direction', 'N/A').upper()})\n"
+                        f"• MACD: {signals.get('macd', {}).get('direction', 'N/A').upper()} "
+                        f"(hist: {signals.get('macd', {}).get('histogram', 0):.2f})\n"
+                        f"• PM Delta: {signals.get('polymarket_delta', {}).get('delta', 0):.3f}"
                     )
                 else:
                     outcome = "yes" if prediction == "up" else "no"
@@ -1716,6 +2216,7 @@ def bot_loop(send_notification):
                             f"✅ **Trade Executed**\n"
                             f"Market: {market.get('question', 'N/A')[:50]}...\n"
                             f"Side: {outcome.upper()}\n"
+                            f"Confidence: {confidence:.1f}%\n"
                             f"Amount: ${trade_amount}\n"
                             f"Price: {result.get('price', 'N/A')}"
                         )
@@ -1825,7 +2326,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 **Trading:**
 /balance - Alle Balances anzeigen
-/predict - Aktuelle Vorhersage
+/predict - Multi-Signal Vorhersage anzeigen 📈
 /markets - Relevante Märkte finden
 /trade - Manueller Trade
 /bridge - Solana→Polygon Bridge
@@ -1843,9 +2344,18 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 /toggle_dry_run - Dry Run Modus umschalten
 /toggle_onchain - Onchain-Modus umschalten
 
+**Multi-Signal Settings:**
+/set_confidence_threshold - Min. Konfidenz setzen (0-100)
+/set_rsi_params - RSI Parameter (period overbought oversold)
+/set_macd_params - MACD Parameter (fast slow signal)
+
 **Info:**
 /pnl - P&L Historie anzeigen
 /help - Diese Hilfe
+
+📊 **Multi-Signal Trading Engine:**
+Trades werden nur ausgeführt wenn Konfidenz ≥ Schwellenwert.
+Signale: MA Crossover + RSI(14) + MACD + Polymarket Delta
 
 ⚠️ **Sicherheitshinweise:**
 - Private Keys werden nur im Speicher gehalten
@@ -1885,6 +2395,13 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # MATIC-Warnung wenn niedrig
     matic_warning = "⚠️ NIEDRIG!" if matic_bal < 0.1 else ""
+    
+    # Get multi-signal info
+    confidence = pred.get("confidence", 0)
+    meets_threshold = pred.get("meets_threshold", False)
+    min_threshold = bot_config.get("min_confidence_threshold", 70)
+    
+    confidence_status = "✅ WILL TRADE" if meets_threshold else f"⏸️ Below {min_threshold}%"
 
     text = f"""
 📊 **Bot Status (100% Onchain)**
@@ -1898,10 +2415,11 @@ Polygon: {poly_configured} {f"${poly_bal:.2f} USDC" if poly_bal else "Nicht konf
 MATIC: ⛽ {matic_bal:.4f} MATIC {matic_warning}
 Approvals: {approvals}
 
-**Aktuelle Vorhersage:**
+**Multi-Signal Prediction:**
 Asset: {pred.get('crypto', 'N/A').upper()}
 Preis: ${pred.get('price', 0):,.2f}
 Richtung: {pred.get('prediction', 'N/A').upper()}
+Konfidenz: {confidence:.1f}% ({confidence_status})
 
 **Heutiges P&L:**
 Trades: {daily_pnl.get('trades', 0)}
@@ -1911,6 +2429,7 @@ Total: ${pnl.get('total', 0):.2f}
 **Config:**
 Trade Amount: ${bot_config.get('trade_amount', 5.0)}
 Cycle: {bot_config.get('cycle_interval_seconds', 300)}s
+Min Confidence: {min_threshold}%
 Auto MATIC: {'✅' if bot_config.get('auto_matic_topup_enabled', True) else '❌'}
 """
     await update.message.reply_text(text, parse_mode="Markdown")
@@ -1959,22 +2478,65 @@ async def predict_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await unauthorized_response(update)
         return
 
-    await update.message.reply_text("🔮 Analyzing market data...")
+    await update.message.reply_text("🔮 Analyzing market with multi-signal engine...")
 
     pred = get_current_prediction()
 
     emoji = "📈" if pred.get("prediction") == "up" else "📉" if pred.get("prediction") == "down" else "⏸️"
+    confidence = pred.get("confidence", 0)
+    meets_threshold = pred.get("meets_threshold", False)
+    min_threshold = pred.get("min_threshold", 70)
+    
+    # Get signal details
+    signals = pred.get("signals", {})
+    ma_signal = signals.get("ma_crossover", {})
+    rsi_signal = signals.get("rsi", {})
+    macd_signal = signals.get("macd", {})
+    pm_signal = signals.get("polymarket_delta", {})
+    
+    # Confidence bar visualization
+    confidence_bars = "█" * int(confidence / 10) + "░" * (10 - int(confidence / 10))
+    threshold_marker = "▼" if meets_threshold else "▽"
+    
+    trade_status = "✅ WILL TRADE" if meets_threshold else "⏸️ NO TRADE (low confidence)"
 
     text = f"""
-{emoji} **Price Prediction**
+{emoji} **Multi-Signal Prediction**
 
 **Asset:** {pred.get('crypto', 'N/A').upper()}
 **Current Price:** ${pred.get('price', 0):,.2f}
 **Prediction:** {pred.get('prediction', 'N/A').upper()}
 **Data Points:** {pred.get('candles', 0)} candles
 
-**Strategy:**
-MA Crossover ({bot_config.get('short_window', 5)}/{bot_config.get('long_window', 20)})
+📊 **Confidence Score**
+[{confidence_bars}] {confidence:.1f}%
+Threshold: {min_threshold}% {threshold_marker}
+Status: {trade_status}
+
+📈 **Signal Details:**
+
+• **MA Crossover** ({bot_config.get('short_window', 5)}/{bot_config.get('long_window', 20)})
+  Direction: {ma_signal.get('direction', 'N/A').upper()}
+  Strength: {ma_signal.get('strength', 0):.0f}%
+  Short MA: ${ma_signal.get('ma_short', 0):,.2f}
+  Long MA: ${ma_signal.get('ma_long', 0):,.2f}
+
+• **RSI** (Period: {bot_config.get('rsi_period', 14)})
+  Value: {rsi_signal.get('rsi', 0):.1f}
+  Direction: {rsi_signal.get('direction', 'N/A').upper()}
+  Strength: {rsi_signal.get('strength', 0):.0f}%
+  (Overbought: >{bot_config.get('rsi_overbought', 70)}, Oversold: <{bot_config.get('rsi_oversold', 30)})
+
+• **MACD** ({bot_config.get('macd_fast_period', 12)}/{bot_config.get('macd_slow_period', 26)}/{bot_config.get('macd_signal_period', 9)})
+  Histogram: {macd_signal.get('histogram', 0):.2f}
+  Direction: {macd_signal.get('direction', 'N/A').upper()}
+  Strength: {macd_signal.get('strength', 0):.0f}%
+
+• **Polymarket Delta**
+  Market Price: {pred.get('polymarket_price', 0.5):.2%}
+  Fair Value: {pred.get('fair_value', 0.5):.2%}
+  Delta: {pm_signal.get('delta', 0):.3f}
+  Direction: {pm_signal.get('direction', 'N/A').upper()}
 """
     await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -2115,6 +2677,11 @@ async def config_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             InlineKeyboardButton("🌉 Bridge Amount", callback_data="cfg_bridge_amount"),
         ],
         [
+            InlineKeyboardButton("🎯 Confidence", callback_data="cfg_confidence"),
+            InlineKeyboardButton("📊 RSI", callback_data="cfg_rsi"),
+        ],
+        [
+            InlineKeyboardButton("📈 MACD", callback_data="cfg_macd"),
             InlineKeyboardButton("🧪 Toggle Dry Run", callback_data="toggle_dry_run"),
         ],
         [InlineKeyboardButton("« Back", callback_data="back_main")],
@@ -2122,6 +2689,9 @@ async def config_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     mode = "🧪 Dry Run" if bot_config.get("dry_run", True) else "💰 Live Trading"
+    
+    # Get signal weights
+    weights = bot_config.get("signal_weights", {})
 
     text = f"""
 ⚙️ **Bot Configuration**
@@ -2132,9 +2702,28 @@ Trade Amount: ${bot_config.get('trade_amount', 5.0)}
 Cycle Interval: {bot_config.get('cycle_interval_seconds', 300)}s
 Asset: {bot_config.get('crypto_id', 'bitcoin')}
 
-**Strategy:**
-Short MA: {bot_config.get('short_window', 5)}
-Long MA: {bot_config.get('long_window', 20)}
+**Multi-Signal Engine:**
+Min Confidence: {bot_config.get('min_confidence_threshold', 70)}%
+
+**Signal Weights:**
+• MA Crossover: {weights.get('ma_crossover', 30)}%
+• RSI: {weights.get('rsi', 30)}%
+• MACD: {weights.get('macd', 25)}%
+• PM Delta: {weights.get('polymarket_delta', 15)}%
+
+**MA Settings:**
+Short Window: {bot_config.get('short_window', 5)}
+Long Window: {bot_config.get('long_window', 20)}
+
+**RSI Settings:**
+Period: {bot_config.get('rsi_period', 14)}
+Overbought: {bot_config.get('rsi_overbought', 70)}
+Oversold: {bot_config.get('rsi_oversold', 30)}
+
+**MACD Settings:**
+Fast: {bot_config.get('macd_fast_period', 12)}
+Slow: {bot_config.get('macd_slow_period', 26)}
+Signal: {bot_config.get('macd_signal_period', 9)}
 
 **Auto-Fund:**
 Min Polygon Balance: ${bot_config.get('min_poly_balance_usdc', 20.0)}
@@ -2424,6 +3013,168 @@ async def set_interval_receive(update: Update, context: ContextTypes.DEFAULT_TYP
     except ValueError as e:
         await update.message.reply_text(f"❌ Invalid interval: {e}")
         return AWAITING_CYCLE_INTERVAL
+
+    return ConversationHandler.END
+
+
+# ---------------------------------------------------------------------------
+# Multi-Signal Configuration Commands
+# ---------------------------------------------------------------------------
+
+
+async def set_confidence_threshold_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Start setting confidence threshold."""
+    if not is_authorized(update):
+        await unauthorized_response(update)
+        return ConversationHandler.END
+
+    await update.message.reply_text(
+        f"🎯 **Set Confidence Threshold**\n\n"
+        f"Current: {bot_config.get('min_confidence_threshold', 70)}%\n\n"
+        f"Trades are only executed when confidence ≥ this threshold.\n"
+        f"Send a value between 0 and 100.\n\n"
+        f"Send /cancel to abort.",
+        parse_mode="Markdown",
+    )
+    return AWAITING_CONFIDENCE_THRESHOLD
+
+
+async def set_confidence_threshold_receive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Receive confidence threshold."""
+    try:
+        threshold = int(update.message.text.strip())
+        if threshold < 0 or threshold > 100:
+            raise ValueError("Threshold must be between 0 and 100")
+
+        bot_config["min_confidence_threshold"] = threshold
+        save_config()
+
+        await update.message.reply_text(
+            f"✅ Confidence threshold set to {threshold}%\n\n"
+            f"Bot will only trade when confidence ≥ {threshold}%",
+            parse_mode="Markdown",
+        )
+    except ValueError as e:
+        await update.message.reply_text(f"❌ Invalid threshold: {e}")
+        return AWAITING_CONFIDENCE_THRESHOLD
+
+    return ConversationHandler.END
+
+
+async def set_rsi_params_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Start setting RSI parameters."""
+    if not is_authorized(update):
+        await unauthorized_response(update)
+        return ConversationHandler.END
+
+    await update.message.reply_text(
+        f"📊 **Set RSI Parameters**\n\n"
+        f"Current Settings:\n"
+        f"• Period: {bot_config.get('rsi_period', 14)}\n"
+        f"• Overbought: {bot_config.get('rsi_overbought', 70)}\n"
+        f"• Oversold: {bot_config.get('rsi_oversold', 30)}\n\n"
+        f"Send values in format: `period overbought oversold`\n"
+        f"Example: `14 70 30`\n\n"
+        f"Send /cancel to abort.",
+        parse_mode="Markdown",
+    )
+    return AWAITING_RSI_PERIOD
+
+
+async def set_rsi_params_receive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Receive RSI parameters."""
+    try:
+        parts = update.message.text.strip().split()
+        if len(parts) != 3:
+            raise ValueError("Please provide exactly 3 values: period overbought oversold")
+        
+        period = int(parts[0])
+        overbought = int(parts[1])
+        oversold = int(parts[2])
+        
+        if period < 2 or period > 50:
+            raise ValueError("Period must be between 2 and 50")
+        if overbought < 50 or overbought > 100:
+            raise ValueError("Overbought must be between 50 and 100")
+        if oversold < 0 or oversold > 50:
+            raise ValueError("Oversold must be between 0 and 50")
+        if oversold >= overbought:
+            raise ValueError("Oversold must be less than overbought")
+
+        bot_config["rsi_period"] = period
+        bot_config["rsi_overbought"] = overbought
+        bot_config["rsi_oversold"] = oversold
+        save_config()
+
+        await update.message.reply_text(
+            f"✅ RSI parameters updated:\n"
+            f"• Period: {period}\n"
+            f"• Overbought: {overbought}\n"
+            f"• Oversold: {oversold}",
+            parse_mode="Markdown",
+        )
+    except ValueError as e:
+        await update.message.reply_text(f"❌ Invalid parameters: {e}")
+        return AWAITING_RSI_PERIOD
+
+    return ConversationHandler.END
+
+
+async def set_macd_params_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Start setting MACD parameters."""
+    if not is_authorized(update):
+        await unauthorized_response(update)
+        return ConversationHandler.END
+
+    await update.message.reply_text(
+        f"📈 **Set MACD Parameters**\n\n"
+        f"Current Settings:\n"
+        f"• Fast Period: {bot_config.get('macd_fast_period', 12)}\n"
+        f"• Slow Period: {bot_config.get('macd_slow_period', 26)}\n"
+        f"• Signal Period: {bot_config.get('macd_signal_period', 9)}\n\n"
+        f"Send values in format: `fast slow signal`\n"
+        f"Example: `12 26 9`\n\n"
+        f"Send /cancel to abort.",
+        parse_mode="Markdown",
+    )
+    return AWAITING_MACD_PARAMS
+
+
+async def set_macd_params_receive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Receive MACD parameters."""
+    try:
+        parts = update.message.text.strip().split()
+        if len(parts) != 3:
+            raise ValueError("Please provide exactly 3 values: fast slow signal")
+        
+        fast = int(parts[0])
+        slow = int(parts[1])
+        signal = int(parts[2])
+        
+        if fast < 2 or fast > 50:
+            raise ValueError("Fast period must be between 2 and 50")
+        if slow < 5 or slow > 100:
+            raise ValueError("Slow period must be between 5 and 100")
+        if signal < 2 or signal > 50:
+            raise ValueError("Signal period must be between 2 and 50")
+        if fast >= slow:
+            raise ValueError("Fast period must be less than slow period")
+
+        bot_config["macd_fast_period"] = fast
+        bot_config["macd_slow_period"] = slow
+        bot_config["macd_signal_period"] = signal
+        save_config()
+
+        await update.message.reply_text(
+            f"✅ MACD parameters updated:\n"
+            f"• Fast Period: {fast}\n"
+            f"• Slow Period: {slow}\n"
+            f"• Signal Period: {signal}",
+            parse_mode="Markdown",
+        )
+    except ValueError as e:
+        await update.message.reply_text(f"❌ Invalid parameters: {e}")
+        return AWAITING_MACD_PARAMS
 
     return ConversationHandler.END
 
@@ -3115,6 +3866,38 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         context.user_data.pop("trade_market", None)
         await query.edit_message_text("❌ Trade cancelled")
 
+    elif data == "cfg_confidence":
+        text = (
+            f"🎯 **Confidence Threshold**\n\n"
+            f"Current: {bot_config.get('min_confidence_threshold', 70)}%\n\n"
+            f"Trades only execute when confidence ≥ this value.\n\n"
+            f"Use `/set_confidence_threshold` to change."
+        )
+        keyboard = [[InlineKeyboardButton("« Back", callback_data="config")]]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+    elif data == "cfg_rsi":
+        text = (
+            f"📊 **RSI Settings**\n\n"
+            f"Period: {bot_config.get('rsi_period', 14)}\n"
+            f"Overbought: {bot_config.get('rsi_overbought', 70)}\n"
+            f"Oversold: {bot_config.get('rsi_oversold', 30)}\n\n"
+            f"Use `/set_rsi_params` to change."
+        )
+        keyboard = [[InlineKeyboardButton("« Back", callback_data="config")]]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+    elif data == "cfg_macd":
+        text = (
+            f"📈 **MACD Settings**\n\n"
+            f"Fast Period: {bot_config.get('macd_fast_period', 12)}\n"
+            f"Slow Period: {bot_config.get('macd_slow_period', 26)}\n"
+            f"Signal Period: {bot_config.get('macd_signal_period', 9)}\n\n"
+            f"Use `/set_macd_params` to change."
+        )
+        keyboard = [[InlineKeyboardButton("« Back", callback_data="config")]]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
     elif data == "back_main":
         # Return to main menu
         keyboard = [
@@ -3236,6 +4019,31 @@ def main() -> None:
         fallbacks=[CommandHandler("cancel", cancel_conversation)],
     )
 
+    # Multi-signal configuration conversation handlers
+    confidence_conv = ConversationHandler(
+        entry_points=[CommandHandler("set_confidence_threshold", set_confidence_threshold_start)],
+        states={
+            AWAITING_CONFIDENCE_THRESHOLD: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_confidence_threshold_receive)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_conversation)],
+    )
+
+    rsi_conv = ConversationHandler(
+        entry_points=[CommandHandler("set_rsi_params", set_rsi_params_start)],
+        states={
+            AWAITING_RSI_PERIOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_rsi_params_receive)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_conversation)],
+    )
+
+    macd_conv = ConversationHandler(
+        entry_points=[CommandHandler("set_macd_params", set_macd_params_start)],
+        states={
+            AWAITING_MACD_PARAMS: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_macd_params_receive)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_conversation)],
+    )
+
     # Add handlers
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
@@ -3263,6 +4071,10 @@ def main() -> None:
     application.add_handler(min_balance_conv)
     application.add_handler(bridge_amount_conv)
     application.add_handler(interval_conv)
+    # Multi-signal configuration handlers
+    application.add_handler(confidence_conv)
+    application.add_handler(rsi_conv)
+    application.add_handler(macd_conv)
 
     # Add callback query handler
     application.add_handler(CallbackQueryHandler(button_callback))
@@ -3270,6 +4082,7 @@ def main() -> None:
     # Start the bot
     print("Bot is running. Press Ctrl+C to stop.")
     print("100% Onchain-Modus aktiviert - Keine API-Credentials benötigt!")
+    print("Multi-Signal Trading Engine aktiv (RSI, MACD, MA, Polymarket Delta)")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
