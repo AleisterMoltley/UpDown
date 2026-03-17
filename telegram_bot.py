@@ -3387,15 +3387,13 @@ def bot_loop(send_notification):
 
                 if bot_config.get("dry_run", True):
                     outcome = "YES" if prediction == "up" else "NO"
-                    # Calculate Kelly size for dry run display
+                    # Calculate Kelly size for dry run display (no config persistence)
                     current_balance = get_polygon_balance()
                     kelly_size = kelly_position_size(
                         confidence=total_confidence,
                         balance=current_balance,
                         deviation_pct=deviation_pct,
                     )
-                    # Update config with Kelly size even in dry run
-                    bot_config["trade_amount"] = kelly_size
                     
                     logger.info(f"[Dry run] Would buy {outcome} on {market.get('question')}")
                     send_notification(
@@ -3433,12 +3431,11 @@ def bot_loop(send_notification):
                     )
                     # Store Kelly-calculated size in config (overrides fixed value)
                     bot_config["trade_amount"] = kelly_size
-                    trade_amount = kelly_size
                     
                     result = place_trade(
                         market,
                         outcome=outcome,
-                        amount=trade_amount,
+                        amount=kelly_size,
                         send_alert=send_notification,
                     )
 
@@ -3451,7 +3448,7 @@ def bot_loop(send_notification):
                             f"Base Confidence: {confidence:.1f}%\n"
                             f"📈 Deviation: {deviation_pct:.1f}% ({direction})\n"
                             f"🎯 Total Confidence: {total_confidence:.1f}%\n"
-                            f"💰 Kelly Size: ${trade_amount:.2f} (Balance: ${current_balance:.2f})\n"
+                            f"💰 Kelly Size: ${kelly_size:.2f} (Balance: ${current_balance:.2f})\n"
                             f"Price: {result.get('price', 'N/A')}"
                             f"{logreg_text}"
                         )
@@ -5073,8 +5070,8 @@ async def trade_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         balance=current_balance,
         deviation_pct=deviation_pct,
     )
-    # Store Kelly-calculated size in config (overrides fixed value)
-    bot_config["trade_amount"] = kelly_size
+    # Store Kelly size in user_data for use when trade is confirmed (not in global config)
+    context.user_data["kelly_trade_amount"] = kelly_size
 
     keyboard = [
         [
@@ -5604,12 +5601,15 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     elif data == "trade_yes":
         market = context.user_data.get("trade_market")
         if market:
-            amount = bot_config.get("trade_amount", 5.0)
+            # Use Kelly-calculated amount if available, fallback to config
+            amount = context.user_data.get("kelly_trade_amount", bot_config.get("trade_amount", 5.0))
             result = place_trade(market, "yes", amount)
             if result.get("success"):
-                text = f"✅ Bought YES for ${amount}"
+                text = f"✅ Bought YES for ${amount:.2f}"
             else:
                 text = f"❌ Trade failed: {result.get('error')}"
+            # Clean up user data
+            context.user_data.pop("kelly_trade_amount", None)
         else:
             text = "❌ No market selected"
         await query.edit_message_text(text)
@@ -5617,18 +5617,22 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     elif data == "trade_no":
         market = context.user_data.get("trade_market")
         if market:
-            amount = bot_config.get("trade_amount", 5.0)
+            # Use Kelly-calculated amount if available, fallback to config
+            amount = context.user_data.get("kelly_trade_amount", bot_config.get("trade_amount", 5.0))
             result = place_trade(market, "no", amount)
             if result.get("success"):
-                text = f"✅ Bought NO for ${amount}"
+                text = f"✅ Bought NO for ${amount:.2f}"
             else:
                 text = f"❌ Trade failed: {result.get('error')}"
+            # Clean up user data
+            context.user_data.pop("kelly_trade_amount", None)
         else:
             text = "❌ No market selected"
         await query.edit_message_text(text)
 
     elif data == "trade_cancel":
         context.user_data.pop("trade_market", None)
+        context.user_data.pop("kelly_trade_amount", None)
         await query.edit_message_text("❌ Trade cancelled")
 
     elif data == "cfg_confidence":
