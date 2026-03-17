@@ -176,6 +176,10 @@ WMATIC_ADDRESS = "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270"
 # Max uint256 für Approvals
 MAX_UINT256 = 2**256 - 1
 
+# Settlement interval limits (in minutes)
+MIN_SETTLEMENT_INTERVAL_MINUTES = 5
+MAX_SETTLEMENT_INTERVAL_MINUTES = 1440  # 24 hours
+
 # Global state
 bot_config: dict = {}
 bot_thread: threading.Thread | None = None
@@ -2363,8 +2367,8 @@ def check_and_settle_positions(send_alert: Callable = None) -> list:
         amount = position.get("amount", 0)
         market_question = position.get("market_question", "")
         
-        # Calculate shares
-        shares = calculate_shares(amount, entry_price) if entry_price > 0 else 0
+        # Calculate shares (calculate_shares handles entry_price <= 0 by returning 0)
+        shares = calculate_shares(amount, entry_price)
         
         # Determine if this position won
         is_winner = resolution_outcome.lower() == side
@@ -2415,8 +2419,16 @@ def check_and_settle_positions(send_alert: Callable = None) -> list:
                 # Determine outcome index (0 for Yes, 1 for No typically)
                 outcome_index = 0 if side == "yes" else 1
                 
+                # Get the condition_id from market data (may differ from market_id)
+                # Gamma API returns 'conditionId' or 'condition_id', fallback to market_id
+                condition_id = (
+                    market.get("conditionId") or 
+                    market.get("condition_id") or 
+                    market_id
+                )
+                
                 redemption_result = redeem_ctf_tokens(
-                    condition_id=market_id,
+                    condition_id=condition_id,
                     outcome_index=outcome_index,
                     amount=token_balance
                 )
@@ -3508,13 +3520,18 @@ async def settlement_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             except Exception as e:
                 logger.error(f"Failed to send settlement update: {e}")
 
-        # Run settlement check in a thread to avoid blocking
-        import functools
+        # Run settlement check - use synchronous call since we're in async context
+        # The notification callback will schedule async updates
         loop = asyncio.get_event_loop()
         
         def sync_alert(text: str):
-            """Sync wrapper for async notification."""
-            asyncio.run_coroutine_threadsafe(send_update(text), loop)
+            """Sync wrapper for async notification with error handling."""
+            future = asyncio.run_coroutine_threadsafe(send_update(text), loop)
+            try:
+                # Wait for result with timeout to catch errors
+                future.result(timeout=10)
+            except Exception as e:
+                logger.error(f"Error sending settlement notification: {e}")
 
         try:
             results = force_settlement_check(send_alert=sync_alert)
@@ -3550,9 +3567,9 @@ async def settlement_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         # Set settlement check interval
         try:
             minutes = int(args[1])
-            if minutes < 5 or minutes > 1440:  # 5 min to 24 hours
+            if minutes < MIN_SETTLEMENT_INTERVAL_MINUTES or minutes > MAX_SETTLEMENT_INTERVAL_MINUTES:
                 await update.message.reply_text(
-                    "❌ Interval must be between 5 and 1440 minutes.",
+                    f"❌ Interval must be between {MIN_SETTLEMENT_INTERVAL_MINUTES} and {MAX_SETTLEMENT_INTERVAL_MINUTES} minutes.",
                     parse_mode="Markdown",
                 )
                 return
