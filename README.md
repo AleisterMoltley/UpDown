@@ -139,4 +139,112 @@ updown_bot.py      Main bot: prediction engine + market discovery + trading loop
 requirements.txt   Python dependencies
 .env.example       Template for environment variables (copy to .env)
 .gitignore         Excludes secrets, venvs, and build artefacts
+railway.json       Railway deployment configuration
+Dockerfile         Multi-stage Docker build (optional)
+.dockerignore      Docker build exclusions
 ```
+
+---
+
+## Deploy to Railway (1-Click from Amsterdam)
+
+[Railway](https://railway.app) provides an easy way to deploy the UpDown bot with automatic builds and zero infrastructure management. The configuration is pre-set for the **Amsterdam/EU region** (`europe-west`).
+
+### Step 1: Connect Your GitHub Repository
+
+1. Go to [railway.app](https://railway.app) and sign in (or create an account)
+2. Click **"New Project"** → **"Deploy from GitHub repo"**
+3. Authorize Railway to access your GitHub account if prompted
+4. Select the **UpDown** repository from the list
+5. Railway will automatically detect the `railway.json` configuration
+
+### Step 2: Configure Environment Variables
+
+> ⚠️ **NEVER commit secrets to source control.** All sensitive values must be set as Railway Variables.
+
+1. In your Railway project, click on your service
+2. Go to the **"Variables"** tab
+3. Click **"+ New Variable"** and add **ALL** required variables:
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `POLYMARKET_PRIVATE_KEY` | ✅ Yes | Your Polygon wallet private key (hex) |
+| `POLYMARKET_API_KEY` | ✅ Yes | Polymarket CLOB API key |
+| `POLYMARKET_API_SECRET` | ✅ Yes | Polymarket CLOB API secret |
+| `POLYMARKET_API_PASSPHRASE` | ✅ Yes | Polymarket CLOB API passphrase |
+| `POLYMARKET_HOST` | No | CLOB endpoint (default: `https://clob.polymarket.com`) |
+| `POLYMARKET_CHAIN_ID` | No | Polygon chain ID (default: `137`) |
+| `CYCLE_INTERVAL_SECONDS` | No | Seconds between cycles (default: `300`) |
+| `SHORT_WINDOW` | No | Fast MA period (default: `5`) |
+| `LONG_WINDOW` | No | Slow MA period (default: `20`) |
+| `SOLANA_PRIVATE_KEY` | For auto-funding | Solana wallet private key (base58) |
+| `SOLANA_RPC_URL` | No | Solana RPC endpoint (default: mainnet) |
+| `MIN_POLY_BALANCE_USDC` | No | Min balance before auto-bridge (default: `20.0`) |
+| `BRIDGE_FUND_AMOUNT` | No | USDC amount to bridge (default: `50.0`) |
+
+### Step 3: Set Python Version to 3.12
+
+Railway uses Nixpacks which auto-detects Python. To ensure Python 3.12:
+
+1. Create a file named `.python-version` in your repo root:
+   ```
+   3.12
+   ```
+2. Or add to Railway Variables:
+   ```
+   NIXPACKS_PYTHON_VERSION=3.12
+   ```
+
+### Step 4: Disable Auto Deploy (Recommended)
+
+For safety, disable automatic deployments so you control when updates go live:
+
+1. In your Railway service, click **"Settings"**
+2. Scroll to **"Deploy"** section
+3. Toggle **"Auto Deploy"** to **OFF**
+4. Now deployments only happen when you click **"Deploy"** manually
+
+### Step 5: Deploy and View Logs
+
+1. Click **"Deploy"** to start the build
+2. Watch the build logs in the **"Deployments"** tab
+3. Once deployed, view runtime logs:
+   - Click on your service
+   - Go to the **"Logs"** tab (or **"Deployments"** → select deployment → **"View Logs"**)
+   - Logs stream in real-time; use the search bar to filter
+4. To check historical logs, click **"Observability"** → **"Logs"**
+
+### Troubleshooting
+
+- **Build fails**: Check that `requirements.txt` is present and valid
+- **Bot exits immediately**: Verify all required environment variables are set
+- **"Dry-run mode"**: Missing Polymarket credentials; add them to Variables
+- **Solana funding not working**: Ensure `SOLANA_PRIVATE_KEY` is set correctly
+
+---
+
+## Docker Deployment (Alternative)
+
+A multi-stage `Dockerfile` is included for containerized deployments.
+
+### Build and Run Locally
+
+```bash
+# Build the image
+docker build -t updown-bot .
+
+# Run with environment variables
+docker run --env-file .env updown-bot
+
+# Or pass variables directly
+docker run \
+  -e POLYMARKET_PRIVATE_KEY=your_key \
+  -e POLYMARKET_API_KEY=your_api_key \
+  -e POLYMARKET_API_SECRET=your_secret \
+  -e POLYMARKET_API_PASSPHRASE=your_passphrase \
+  updown-bot
+```
+
+### Image Size
+
+The multi-stage build produces a minimal image (~150MB) using `python:3.12-slim` and runs as a non-root user for security.
