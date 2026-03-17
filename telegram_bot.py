@@ -213,6 +213,11 @@ DASHBOARD_SCALE_UP_WINRATE_THRESHOLD = 62.0  # Winrate % required to enable scal
 MAX_PROFIT_FACTOR_CAP = 3.0  # Cap infinite profit factor at this value
 DEFAULT_AVG_WIN_PCT = 0.05  # Default 5% average win for projections
 DEFAULT_AVG_LOSS_PCT = 0.05  # Default 5% average loss for projections
+# Win probability calculation: converts deviation % to probability
+# Formula: base_prob + deviation_pct / deviation_to_prob_factor
+WIN_PROB_BASE = 0.5  # Base win probability (50%)
+WIN_PROB_DEVIATION_FACTOR = 200  # Divisor for deviation to probability conversion
+WIN_PROB_MAX = 0.85  # Maximum win probability cap (85%)
 
 # Global state
 bot_config: dict = {}
@@ -483,7 +488,8 @@ def calculate_projected_monthly_return() -> dict:
     if backtest:
         winrate = backtest.get("winrate", 50)
         profit_factor = backtest.get("profit_factor", 1.0)
-        if isinstance(profit_factor, str) and profit_factor == "∞":
+        # Handle infinity symbol (string) or actual infinity (float)
+        if profit_factor == "∞" or (isinstance(profit_factor, float) and profit_factor == float("inf")):
             profit_factor = MAX_PROFIT_FACTOR_CAP
         avg_trades_per_day = backtest.get("total_trades", 30) / 30  # 30-day backtest
     else:
@@ -503,9 +509,13 @@ def calculate_projected_monthly_return() -> dict:
     avg_win_pct = DEFAULT_AVG_WIN_PCT
     avg_loss_pct = DEFAULT_AVG_LOSS_PCT
     
-    if profit_factor != float("inf") and profit_factor > 0:
+    # Edge formula: EV = (win_prob * avg_win) - (loss_prob * adjusted_loss)
+    # The profit factor represents how much larger wins are vs losses.
+    # When profit_factor > 1, losses have less impact (adjusted by dividing).
+    if isinstance(profit_factor, (int, float)) and profit_factor > 0:
         edge_per_trade = (win_prob * avg_win_pct) - (loss_prob * avg_loss_pct / profit_factor)
     else:
+        # Fallback when profit_factor is invalid (zero, negative, or non-numeric)
         edge_per_trade = (win_prob * avg_win_pct) - (loss_prob * avg_loss_pct)
     
     # Monthly projection
@@ -566,7 +576,8 @@ def get_next_trade_opportunities(count: int = 3) -> list[dict]:
             # For mispriced markets, the edge is approximately the deviation percentage
             
             # Estimate win probability based on our edge (deviation from fair value)
-            win_prob = min(0.5 + dev_pct / 200, 0.85)  # Cap at 85%
+            # Higher deviation = higher win probability (more mispricing = more edge)
+            win_prob = min(WIN_PROB_BASE + dev_pct / WIN_PROB_DEVIATION_FACTOR, WIN_PROB_MAX)
             
             # Expected value per $1 invested
             # If we buy at current_price and win, we get $1
