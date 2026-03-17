@@ -471,14 +471,65 @@ def check_and_fund_polygon(clob, dry_run: bool = False) -> None:
 # Data fetching
 # ---------------------------------------------------------------------------
 
-def fetch_5min_data(crypto_id: str = "bitcoin", vs_currency: str = "usd") -> list:
+def fetch_5min_data(
+    crypto_id: str = "bitcoin",
+    vs_currency: str = "usd",
+    max_retries: int = 3,
+) -> list:
     """Fetch the last 24 hours of 5-minute OHLC candles from CoinGecko.
 
     Returns a list of [timestamp, open, high, low, close] lists.
     CoinGecko returns the finest granularity (≈5 min) when *days* is set to 1.
+
+    Args:
+        crypto_id: CoinGecko asset ID (e.g., 'bitcoin', 'ethereum').
+        vs_currency: Currency for price conversion (e.g., 'usd').
+        max_retries: Number of retry attempts for transient failures.
+
+    Returns:
+        List of OHLC candles [[timestamp, open, high, low, close], ...].
+
+    Raises:
+        ConnectionError: When unable to connect to CoinGecko API after retries.
+        ValueError: When API returns invalid data.
     """
-    ohlc = cg.get_coin_ohlc_by_id(id=crypto_id, vs_currency=vs_currency, days="1")
-    return ohlc  # [[timestamp_ms, open, high, low, close], ...]
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            ohlc = cg.get_coin_ohlc_by_id(
+                id=crypto_id, vs_currency=vs_currency, days="1"
+            )
+            if ohlc is None or not isinstance(ohlc, list):
+                raise ValueError(f"Invalid response from CoinGecko API: {ohlc}")
+            return ohlc
+        except requests.exceptions.ConnectionError as e:
+            last_error = e
+            print(
+                f"CoinGecko API connection failed (attempt {attempt + 1}/{max_retries}): {e}"
+            )
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s
+                time.sleep(wait_time)
+        except requests.exceptions.Timeout as e:
+            last_error = e
+            print(
+                f"CoinGecko API timeout (attempt {attempt + 1}/{max_retries}): {e}"
+            )
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)
+        except Exception as e:
+            # For other errors, don't retry - could be rate limit or invalid request
+            print(f"CoinGecko API error: {e}")
+            raise
+
+    # All retries exhausted
+    error_msg = (
+        f"Failed to connect to CoinGecko API after {max_retries} attempts. "
+        "This may be caused by: network issues, firewall blocking api.coingecko.com, "
+        "or CoinGecko service unavailability."
+    )
+    print(error_msg)
+    raise ConnectionError(error_msg) from last_error
 
 
 # ---------------------------------------------------------------------------
