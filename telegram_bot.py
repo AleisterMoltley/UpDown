@@ -1286,14 +1286,19 @@ def sell_position(position: dict) -> dict:
         signed_order = clob.sign_order(order)
         resp = clob.post_order(signed_order)
 
-        # Check if order was accepted (basic validation)
-        # Note: This is a limit order, so it may not fill immediately
-        # The position is closed optimistically - if order fails to fill,
-        # user should monitor positions manually
-        order_success = resp is not None
+        # Check if order was accepted
+        # The CLOB API typically returns a dict with orderID on success
+        order_success = False
+        if resp is not None:
+            if isinstance(resp, dict):
+                # Check for common success indicators
+                order_success = "orderID" in resp or "id" in resp or resp.get("success", False)
+            else:
+                # Non-dict response, assume success if not None
+                order_success = True
 
         if not order_success:
-            logger.warning(f"Sell order may not have been accepted for token {token_id}")
+            logger.warning(f"Sell order may not have been accepted for token {token_id}: {resp}")
 
         # Close the position in our store
         market_id = position.get("market_id", "")
@@ -1568,14 +1573,16 @@ def bot_loop(send_notification):
             prediction = pred.get("prediction", "hold")
 
             if prediction == "hold":
+                # Skip the cycle but don't update previous_prediction
+                # This way, "hold" states are transparent to flip detection
                 logger.info("Not enough data - skipping trade")
                 wait_with_check(bot_config.get("cycle_interval_seconds", 300))
                 continue
 
             # Check for prediction flip and exit positions if needed
-            # Note: The "hold" state is skipped earlier, so prediction flip detection
-            # only occurs between "up" and "down" states. Transitions like "up" → "hold" → "down"
-            # won't trigger exits during the "hold" phase, only when a definite direction returns.
+            # Note: Because "hold" states are skipped above, previous_prediction
+            # always holds the last directional prediction ("up" or "down").
+            # Transitions like "up" → "hold" → "down" trigger exits when "down" arrives.
             if not bot_config.get("dry_run", True):
                 if previous_prediction is not None and previous_prediction != prediction:
                     logger.info(f"Prediction flipped: {previous_prediction} → {prediction}")
