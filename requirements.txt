@@ -5,6 +5,5 @@ solana>=0.34.0
 solders
 base58
 eth-account>=0.8.0
-spl-token>=0.3.0
 python-telegram-bot>=20.0
 python-dotenv>=1.0.0
