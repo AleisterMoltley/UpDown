@@ -47,8 +47,11 @@ KELLY_MIN_TRADE_USD = 3.0  # Minimum $3 per trade
 WFO_NUM_TRAINING_WINDOWS = 5  # 5 training windows
 WFO_PARAM_RANGE_MIN = 5  # Minimum value for parameter optimization
 WFO_PARAM_RANGE_MAX = 20  # Maximum value for parameter optimization
+WFO_MIN_WINDOW_SIZE = 100  # Minimum data points required per window for WFO
+WFO_MIN_TRADES_FOR_OPTIMIZATION = 5  # Minimum trades required to consider params valid
 VOLUME_MOMENTUM_WEIGHT = 10  # 10% weight for volume_momentum signal
 VOLUME_MOMENTUM_BONUS = 15  # +15 confidence when volume & price both rise
+MAX_PROFIT_FACTOR_VALUE = 999.0  # Cap for infinite profit factor in comparisons
 
 # File paths
 BACKTEST_RESULTS_FILE = Path("daily_pnl.json")
@@ -666,6 +669,16 @@ def calculate_volume_momentum_signal(
     price_short_avg = sum(closes[-short_period:]) / short_period
     price_long_avg = sum(closes[-long_period:]) / long_period
     
+    # Guard against division by zero
+    if vol_long_ma <= 0:
+        return {
+            "direction": "neutral",
+            "strength": 0,
+            "volume_rising": False,
+            "price_rising": False,
+            "bonus": 0,
+        }
+    
     volume_rising = vol_short_ma > vol_long_ma
     price_rising = price_short_avg > price_long_avg
     
@@ -807,6 +820,8 @@ def optimize_params_brute_force(
     best_metrics = {"winrate": 0, "profit_factor": 0, "trades": 0}
     
     # Brute-force search through parameter combinations
+    # Note: This creates ~16*4*4 = 256 combinations per optimization run
+    # Each combination runs a mini-backtest, so total time scales linearly
     for short_window in range(min_val, max_val + 1):
         for long_window in range(short_window + 2, max_val + 1):  # long > short + 1
             for rsi_ob in range(65, 81, 5):  # RSI overbought: 65, 70, 75, 80
@@ -823,8 +838,9 @@ def optimize_params_brute_force(
                         closes, volumes, config, min_confidence, trade_size_pct
                     )
                     
-                    # Select based on profit factor (with minimum trades requirement)
-                    if metrics["trades"] >= 5 and metrics["profit_factor"] > best_profit_factor:
+                    # Require minimum trades to avoid overfitting to small samples
+                    # A minimum of 5 trades ensures statistical significance
+                    if metrics["trades"] >= WFO_MIN_TRADES_FOR_OPTIMIZATION and metrics["profit_factor"] > best_profit_factor:
                         best_profit_factor = metrics["profit_factor"]
                         best_params = config.copy()
                         best_metrics = metrics.copy()
@@ -915,11 +931,16 @@ def _run_mini_backtest(
     
     total_trades = winning + losing
     winrate = (winning / total_trades * 100) if total_trades > 0 else 0
-    profit_factor = (total_profit / abs(total_loss)) if total_loss != 0 else (float("inf") if total_profit > 0 else 0)
+    
+    # Calculate profit factor, capping infinite values for comparison
+    if total_loss != 0:
+        profit_factor = total_profit / abs(total_loss)
+    else:
+        profit_factor = MAX_PROFIT_FACTOR_VALUE if total_profit > 0 else 0
     
     return {
         "winrate": winrate,
-        "profit_factor": profit_factor if profit_factor != float("inf") else 999.0,
+        "profit_factor": min(profit_factor, MAX_PROFIT_FACTOR_VALUE),
         "trades": total_trades,
     }
 
@@ -943,6 +964,8 @@ def save_optimized_params(params: dict) -> None:
         config["long_window"] = params.get("long_window", 20)
         config["rsi_overbought"] = params.get("rsi_overbought", 70)
         config["rsi_oversold"] = params.get("rsi_oversold", 30)
+        # Timestamp of last WFO run - useful for tracking when params were last optimized
+        # and deciding whether to re-run optimization
         config["wfo_last_optimized"] = datetime.now(timezone.utc).isoformat()
         
         # Update signal weights to include volume_momentum
@@ -1008,7 +1031,12 @@ def run_backtest(
     
     # Ensure volumes list matches closes length
     if len(volumes) < len(closes):
-        volumes.extend([volumes[-1]] * (len(closes) - len(volumes)))
+        padding_count = len(closes) - len(volumes)
+        logger.warning(
+            f"Volume data shorter than price data by {padding_count} points. "
+            f"Padding with last known volume value. This may affect volume_momentum accuracy."
+        )
+        volumes.extend([volumes[-1]] * padding_count)
     elif len(volumes) > len(closes):
         volumes = volumes[:len(closes)]
     
@@ -1023,8 +1051,11 @@ def run_backtest(
     total_windows = WFO_NUM_TRAINING_WINDOWS + 1  # 5 training + 1 test = 6
     window_size = len(closes) // total_windows
     
-    if window_size < 100:
-        logger.warning("Insufficient data for Walk-Forward Optimization, falling back to simple backtest")
+    if window_size < WFO_MIN_WINDOW_SIZE:
+        logger.warning(
+            f"Insufficient data for Walk-Forward Optimization: window_size={window_size} < "
+            f"minimum required={WFO_MIN_WINDOW_SIZE}. Falling back to simple backtest."
+        )
         return _run_simple_backtest(closes, volumes, min_confidence, trade_size_pct, config)
     
     logger.info(f"WFO: {total_windows} windows, {window_size} data points each")
