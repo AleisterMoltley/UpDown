@@ -24,7 +24,7 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import requests
 from dotenv import load_dotenv
@@ -350,7 +350,7 @@ def get_positions_for_market(market_id: str) -> list:
 def check_risk_limits(
     trade_amount: float = 0.0,
     market_id: str = "",
-    send_alert: callable = None,
+    send_alert: Callable = None,
 ) -> dict:
     """Check all risk limits before executing a trade.
 
@@ -442,7 +442,7 @@ def check_risk_limits(
     return {"allowed": True, "reason": ""}
 
 
-def record_trade_result(is_win: bool, send_alert: callable = None) -> None:
+def record_trade_result(is_win: bool, send_alert: Callable = None) -> None:
     """Record a trade result for circuit breaker tracking.
 
     Args:
@@ -601,7 +601,7 @@ def close_position(
     token_id: str,
     exit_price: float,
     resolution: str | None = None,
-    send_alert: callable = None,
+    send_alert: Callable = None,
 ) -> dict | None:
     """Close an open position and calculate realized P&L.
 
@@ -1983,7 +1983,7 @@ def place_trade(
     market: dict,
     outcome: str = "yes",
     amount: float = 10.0,
-    send_alert: callable = None,
+    send_alert: Callable = None,
     skip_risk_check: bool = False,
 ) -> dict:
     """Place a limit order on a Polymarket market.
@@ -2079,7 +2079,7 @@ def get_market_by_id(market_id: str) -> dict | None:
         return None
 
 
-def check_resolved_markets(send_alert: callable = None) -> list:
+def check_resolved_markets(send_alert: Callable = None) -> list:
     """Check open positions for resolved markets and calculate realized P&L.
 
     Args:
