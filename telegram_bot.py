@@ -907,24 +907,6 @@ def get_solana_balance() -> dict:
         return {}
 
 
-def get_polygon_balance() -> float:
-    """Get Polygon USDC balance via CLOB client."""
-    clob = _build_clob_client()
-    if clob is None:
-        return 0.0
-    try:
-        balance_info = clob.get_balance()
-        if isinstance(balance_info, dict):
-            return float(balance_info.get("balance", 0) or 0)
-        return float(balance_info or 0)
-    except Exception as e:
-        # Invalidate cache on authentication errors (401/403)
-        if _is_auth_error(e):
-            invalidate_l2_credentials_cache()
-        logger.error(f"Error fetching Polygon balance: {e}")
-        return 0.0
-
-
 def _is_l2_credentials_valid() -> bool:
     """Check if cached L2 credentials are still valid (not expired).
     
@@ -977,6 +959,7 @@ def _is_auth_error(exception: Exception) -> bool:
     
     return False
 
+
 def _build_clob_client():
     """Construct a ClobClient im 100% onchain-Modus.
     
@@ -1001,7 +984,7 @@ def _build_clob_client():
         
         # Check if we have valid cached credentials
         if _is_l2_credentials_valid():
-            logger.debug("Verwende gecachte L2-API-Credentials")
+            logger.info("Verwende gecachte L2-API-Credentials")
             return ClobClient(
                 host=bot_config.get("polymarket_host", "https://clob.polymarket.com"),
                 chain_id=bot_config.get("chain_id", 137),
@@ -1060,6 +1043,24 @@ def _build_clob_client():
     except Exception as e:
         logger.error(f"Fehler beim Erstellen des ClobClient: {e}")
         return None
+
+
+def get_polygon_balance() -> float:
+    """Get Polygon USDC balance via CLOB client."""
+    clob = _build_clob_client()
+    if clob is None:
+        return 0.0
+    try:
+        balance_info = clob.get_balance()
+        if isinstance(balance_info, dict):
+            return float(balance_info.get("balance", 0) or 0)
+        return float(balance_info or 0)
+    except Exception as e:
+        # Invalidate cache on authentication errors (401/403)
+        if _is_auth_error(e):
+            invalidate_l2_credentials_cache()
+        logger.error(f"Error fetching Polygon balance: {e}")
+        return 0.0
 
 
 # ---------------------------------------------------------------------------
