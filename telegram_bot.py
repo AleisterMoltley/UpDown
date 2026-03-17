@@ -3578,6 +3578,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 /predict - Multi-Signal Vorhersage anzeigen 📈
 /markets - Top mispriced Märkte finden 📈
 /scan - Alle Märkte scannen 🔎 (Top 8 Mispriced, ≥12% Deviation)
+/politics_scan - Politics/Economics Scan 🏛️ (vol24h>$150k, <48h Settlement)
 /trade - Manueller Trade (Top 3 Mispriced)
 /bridge - Solana→Polygon Bridge
 
@@ -4015,6 +4016,84 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     except Exception as e:
         logger.error(f"Error in scan_command: {e}")
+        await update.message.reply_text(
+            f"❌ Error scanning markets: {str(e)[:100]}",
+            parse_mode="Markdown",
+        )
+
+
+async def politics_scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /politics_scan command - Scan for high-value politics/economics markets.
+
+    This command focuses on politics, crypto, and economics markets with:
+    - 24h volume > $150k
+    - Settlement within 48 hours (fast settlement = less risk)
+    - Prioritizes politics markets with >8% deviation (often irrational Trump/Biden/News moves)
+    """
+    if not is_authorized(update):
+        await unauthorized_response(update)
+        return
+
+    await update.message.reply_text(
+        "🏛️ Scanning politics/economics markets...\n"
+        "Filters: volume24h > $150k, settlement < 48h, prioritizing politics"
+    )
+
+    try:
+        # Get markets with strict filters for high-value fast-settling opportunities
+        mispriced = get_top_mispriced_markets(
+            count=10,
+            min_deviation_pct=5.0,  # Lower threshold for high-volume markets
+            min_volume_24h=150_000,  # Only markets with > $150k 24h volume
+            categories=["crypto", "politics", "economics"],
+            max_hours_to_settlement=48,  # Fast settlement within 48h
+            prioritize_politics=True,  # Politics with >8% deviation first
+        )
+
+        if not mispriced:
+            await update.message.reply_text(
+                "🏛️ **Politics/Economics Scan Complete**\n\n"
+                "No markets found matching criteria:\n"
+                "• Categories: crypto, politics, economics\n"
+                "• 24h volume > $150k\n"
+                "• Settlement within 48h\n\n"
+                "Try /scan for a broader market overview.",
+                parse_mode="Markdown",
+            )
+            return
+
+        # Format results with special politics indicator
+        lines = ["🏛️ **High-Value Politics/Economics Markets**\n"]
+        lines.append("_Filters: vol24h > $150k, settlement < 48h_\n")
+
+        for i, market in enumerate(mispriced, 1):
+            question = market.get("question", "Unknown")[:60]
+            category = market.get("category", "other")
+            deviation = market.get("price_deviation", {})
+
+            current = deviation.get("current_price", 0)
+            dev_pct = deviation.get("deviation_pct", 0)
+            direction = deviation.get("direction", "unknown")
+
+            # Highlight politics markets with high deviation
+            is_priority = category == "politics" and abs(dev_pct) > 8.0
+            priority_marker = "🔥" if is_priority else ""
+
+            emoji = "📉" if direction == "underpriced" else "📈"
+            cat_emoji = {"politics": "🏛️", "economics": "📊", "crypto": "₿"}.get(category, "📌")
+
+            lines.append(f"**{i}. {question}...** {priority_marker}")
+            lines.append(f"   {emoji} {direction.upper()} by {abs(dev_pct):.1f}%")
+            lines.append(f"   📊 Price: {current:.2%}")
+            lines.append(f"   {cat_emoji} {category.capitalize()}")
+            lines.append("")
+
+        lines.append("_🔥 = Politics high-deviation (often irrational)_")
+
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+    except Exception as e:
+        logger.error(f"Error in politics_scan_command: {e}")
         await update.message.reply_text(
             f"❌ Error scanning markets: {str(e)[:100]}",
             parse_mode="Markdown",
@@ -5939,6 +6018,7 @@ def main() -> None:
     application.add_handler(CommandHandler("predict", predict_command))
     application.add_handler(CommandHandler("markets", markets_command))
     application.add_handler(CommandHandler("scan", scan_command))
+    application.add_handler(CommandHandler("politics_scan", politics_scan_command))
     application.add_handler(CommandHandler("pnl", pnl_command))
     application.add_handler(CommandHandler("positions", positions_command))
     application.add_handler(CommandHandler("settlement", settlement_command))
