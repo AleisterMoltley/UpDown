@@ -320,6 +320,7 @@ Control the entire bot via Telegram - no server access needed after initial setu
 |---------|-------------|
 | `/start` | Main menu with inline buttons |
 | `/status` | View bot status, balances, and predictions |
+| `/dashboard` | 💎 Money Bot Dashboard with live confidence, trades with EV, 7-day chart, projected returns |
 | `/balance` | View Solana and Polygon wallet balances |
 | `/predict` | Get current price prediction |
 | `/markets` | Find relevant Polymarket markets |
@@ -339,6 +340,7 @@ Control the entire bot via Telegram - no server access needed after initial setu
 | `/setup_approvals` | Set up USDC/CTF token approvals for trading |
 | `/gas_status` | Check MATIC balance for gas fees |
 | `/toggle_onchain` | Toggle 100% onchain trading mode |
+| `/backtest` | Run 30-day backtest with 1000 trades |
 | `/help` | Show all commands |
 
 ### Security Features
