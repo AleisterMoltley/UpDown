@@ -139,6 +139,9 @@ DEFAULT_CONFIG = {
     "max_position_size_pct": 10.0,  # Maximum position size as % of balance
     "max_concurrent_positions": 5,  # Maximum number of concurrent open positions
     "circuit_breaker_consecutive_losses": 3,  # Pause after N consecutive losing trades
+    # Position Settlement Tracking Settings
+    "settlement_check_interval": 1800,  # Interval in seconds to poll for market resolution (default: 30 minutes)
+    "auto_redeem_enabled": True,  # Automatically redeem winning outcome tokens on settlement
 }
 
 # Solana USDC token mint address (mainnet)
@@ -173,12 +176,19 @@ WMATIC_ADDRESS = "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270"
 # Max uint256 für Approvals
 MAX_UINT256 = 2**256 - 1
 
+# Settlement interval limits (in minutes)
+MIN_SETTLEMENT_INTERVAL_MINUTES = 5
+MAX_SETTLEMENT_INTERVAL_MINUTES = 1440  # 24 hours
+
 # Global state
 bot_config: dict = {}
 bot_thread: threading.Thread | None = None
 bot_thread_lock = threading.Lock()  # Lock for thread-safe bot start/stop
 stop_event = threading.Event()
 cg = CoinGeckoAPI()
+
+# Settlement tracking state
+_last_settlement_check: float = 0.0  # Timestamp of last settlement check
 
 # ---------------------------------------------------------------------------
 # L2 Credentials Cache
@@ -2140,7 +2150,364 @@ def check_resolved_markets(send_alert: Callable = None) -> list:
     return closed_results
 
 
-def sell_position(position: dict) -> dict:
+def redeem_ctf_tokens(condition_id: str, outcome_index: int, amount: int) -> dict:
+    """Redeem winning outcome tokens from a resolved market via CTF contract.
+    
+    After a market resolves, holders of winning outcome tokens can redeem them
+    for USDC (1 token = 1 USDC if the outcome won).
+    
+    Args:
+        condition_id: The market condition ID (bytes32 in hex format).
+        outcome_index: The winning outcome index (0 for Yes, 1 for No typically).
+        amount: Amount of tokens to redeem (in token units, not USDC).
+    
+    Returns:
+        Dict with 'success', 'tx', and optionally 'error'.
+    """
+    try:
+        w3 = get_web3_client()
+        if w3 is None:
+            return {"success": False, "error": "Web3 nicht verfügbar"}
+        
+        key = bot_config.get("polygon_private_key", "")
+        if not key:
+            return {"success": False, "error": "Kein Polygon Private Key konfiguriert"}
+        
+        from eth_account import Account
+        key_with_prefix = key if key.startswith("0x") else f"0x{key}"
+        account = Account.from_key(key_with_prefix)
+        address = account.address
+        
+        # Check MATIC balance for gas
+        matic_balance = get_matic_balance()
+        if matic_balance < 0.001:
+            return {
+                "success": False, 
+                "error": f"Nicht genug MATIC für Gas! Balance: {matic_balance:.6f} MATIC"
+            }
+        
+        # CTF redeemPositions ABI
+        # Function: redeemPositions(IERC20 collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint[] indexSets)
+        ctf_redeem_abi = [
+            {
+                "inputs": [
+                    {"name": "collateralToken", "type": "address"},
+                    {"name": "parentCollectionId", "type": "bytes32"},
+                    {"name": "conditionId", "type": "bytes32"},
+                    {"name": "indexSets", "type": "uint256[]"}
+                ],
+                "name": "redeemPositions",
+                "outputs": [],
+                "stateMutability": "nonpayable",
+                "type": "function"
+            }
+        ]
+        
+        ctf_contract = w3.eth.contract(
+            address=w3.to_checksum_address(POLYGON_CTF_ADDRESS),
+            abi=ctf_redeem_abi
+        )
+        
+        # Convert condition_id to bytes32
+        if not condition_id.startswith("0x"):
+            condition_id = f"0x{condition_id}"
+        condition_bytes = bytes.fromhex(condition_id[2:].zfill(64))
+        
+        # Parent collection ID is typically 0x0 for Polymarket markets
+        parent_collection_id = bytes(32)
+        
+        # Index sets: for binary markets, [1] for Yes (2^0), [2] for No (2^1)
+        # For winning outcome, we redeem that index set
+        index_set = 1 << outcome_index  # 2^outcome_index
+        
+        # Build the transaction
+        nonce = w3.eth.get_transaction_count(address)
+        gas_price = w3.eth.gas_price
+        
+        tx = ctf_contract.functions.redeemPositions(
+            w3.to_checksum_address(POLYGON_USDC_ADDRESS),  # collateral token (USDC)
+            parent_collection_id,
+            condition_bytes,
+            [index_set]  # indexSets array
+        ).build_transaction({
+            "from": address,
+            "nonce": nonce,
+            "gas": 200000,  # Estimate
+            "gasPrice": gas_price,
+        })
+        
+        # Sign and send
+        signed_tx = w3.eth.account.sign_transaction(tx, key_with_prefix)
+        tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+        
+        logger.info(f"CTF Redemption Tx sent: {tx_hash.hex()}")
+        
+        # Wait for confirmation
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+        
+        if receipt["status"] == 1:
+            return {"success": True, "tx": tx_hash.hex()}
+        return {"success": False, "error": "Transaction reverted", "tx": tx_hash.hex()}
+        
+    except Exception as e:
+        logger.error(f"CTF Redemption Fehler: {e}")
+        return {"success": False, "error": str(e)}
+
+
+def get_ctf_token_balance(token_id: str) -> int:
+    """Get the CTF token balance for a specific token ID.
+    
+    Args:
+        token_id: The token ID (position ID) to check balance for.
+    
+    Returns:
+        Token balance as integer (0 if error or no balance).
+    """
+    try:
+        w3 = get_web3_client()
+        if w3 is None:
+            return 0
+        
+        address = get_polygon_address()
+        if not address:
+            return 0
+        
+        # ERC1155 balanceOf ABI
+        erc1155_abi = [
+            {
+                "constant": True,
+                "inputs": [
+                    {"name": "account", "type": "address"},
+                    {"name": "id", "type": "uint256"}
+                ],
+                "name": "balanceOf",
+                "outputs": [{"name": "", "type": "uint256"}],
+                "type": "function"
+            }
+        ]
+        
+        ctf_contract = w3.eth.contract(
+            address=w3.to_checksum_address(POLYGON_CTF_ADDRESS),
+            abi=erc1155_abi
+        )
+        
+        # Convert token_id to uint256
+        token_id_int = int(token_id) if isinstance(token_id, str) else token_id
+        
+        balance = ctf_contract.functions.balanceOf(
+            w3.to_checksum_address(address),
+            token_id_int
+        ).call()
+        
+        return balance
+        
+    except Exception as e:
+        logger.error(f"Error getting CTF token balance: {e}")
+        return 0
+
+
+def check_and_settle_positions(send_alert: Callable = None) -> list:
+    """Check for resolved markets and settle positions with optional token redemption.
+    
+    This is the main settlement tracking function that:
+    1. Polls Gamma API for market resolution status
+    2. Calculates P&L for resolved positions
+    3. Optionally redeems winning outcome tokens via CTF contract
+    4. Sends Telegram notifications with results
+    5. Updates P&L tracking
+    
+    Args:
+        send_alert: Optional callback function to send Telegram alerts.
+    
+    Returns:
+        List of settlement results with P&L and redemption info.
+    """
+    global _last_settlement_check
+    
+    # Check if enough time has passed since last check
+    current_time = time.time()
+    settlement_interval = bot_config.get("settlement_check_interval", 1800)  # Default 30 min
+    
+    if current_time - _last_settlement_check < settlement_interval:
+        # Not enough time has passed, skip this check
+        return []
+    
+    _last_settlement_check = current_time
+    logger.info("Running scheduled settlement check...")
+    
+    open_positions = get_open_positions()
+    if not open_positions:
+        logger.info("No open positions to check for settlement")
+        return []
+    
+    settlement_results = []
+    auto_redeem = bot_config.get("auto_redeem_enabled", True)
+    
+    for position in open_positions:
+        market_id = position.get("market_id", "")
+        if not market_id:
+            continue
+        
+        market = get_market_by_id(market_id)
+        if market is None:
+            logger.warning(f"Could not fetch market {market_id} for settlement check")
+            continue
+        
+        # Check if market is resolved
+        is_closed = market.get("closed", False)
+        resolution_outcome = market.get("resolvedOutcome") or market.get("resolved_outcome")
+        
+        if not (is_closed and resolution_outcome):
+            continue  # Market not yet resolved
+        
+        # Market resolved - determine settlement price and outcome
+        side = position.get("side", "").lower()
+        token_id = position.get("token_id", "")
+        entry_price = position.get("entry_price", 0)
+        amount = position.get("amount", 0)
+        market_question = position.get("market_question", "")
+        
+        # Calculate shares (calculate_shares handles entry_price <= 0 by returning 0)
+        shares = calculate_shares(amount, entry_price)
+        
+        # Determine if this position won
+        is_winner = resolution_outcome.lower() == side
+        exit_price = 1.0 if is_winner else 0.0
+        
+        # Calculate P&L
+        exit_value = shares * exit_price
+        realized_pnl = exit_value - amount
+        
+        # Close the position
+        closed = close_position(
+            market_id=market_id,
+            token_id=token_id,
+            exit_price=exit_price,
+            resolution=resolution_outcome,
+            send_alert=send_alert,
+        )
+        
+        result = {
+            "position": closed,
+            "market_question": market_question,
+            "resolution": resolution_outcome,
+            "is_winner": is_winner,
+            "entry_price": entry_price,
+            "exit_price": exit_price,
+            "amount_invested": amount,
+            "shares": shares,
+            "realized_pnl": realized_pnl,
+            "redemption_attempted": False,
+            "redemption_success": False,
+            "redemption_tx": None,
+        }
+        
+        if closed:
+            # Record the P&L in daily totals
+            record_trade(0, realized_pnl)
+        
+        # Attempt CTF token redemption for winning positions
+        if is_winner and auto_redeem and not bot_config.get("dry_run", True):
+            logger.info(f"Attempting to redeem winning tokens for market {market_id[:20]}...")
+            
+            # Get CTF token balance to see if there are tokens to redeem
+            token_balance = get_ctf_token_balance(token_id)
+            
+            if token_balance > 0:
+                result["redemption_attempted"] = True
+                
+                # Determine outcome index (0 for Yes, 1 for No typically)
+                outcome_index = 0 if side == "yes" else 1
+                
+                # Get the condition_id from market data (may differ from market_id)
+                # Gamma API returns 'conditionId' or 'condition_id', fallback to market_id
+                condition_id = (
+                    market.get("conditionId") or 
+                    market.get("condition_id") or 
+                    market_id
+                )
+                
+                redemption_result = redeem_ctf_tokens(
+                    condition_id=condition_id,
+                    outcome_index=outcome_index,
+                    amount=token_balance
+                )
+                
+                if redemption_result.get("success"):
+                    result["redemption_success"] = True
+                    result["redemption_tx"] = redemption_result.get("tx")
+                    logger.info(f"Successfully redeemed tokens: {redemption_result.get('tx')}")
+                else:
+                    logger.warning(f"Token redemption failed: {redemption_result.get('error')}")
+                    result["redemption_error"] = redemption_result.get("error")
+            else:
+                logger.info(f"No CTF tokens to redeem for position {token_id}")
+        
+        # Send detailed notification
+        if send_alert:
+            emoji = "🎉" if is_winner else "📉"
+            pnl_emoji = "📈" if realized_pnl >= 0 else "📉"
+            
+            msg = (
+                f"{emoji} **Position Settled**\n\n"
+                f"**Market:** {market_question[:80]}{'...' if len(market_question) > 80 else ''}\n\n"
+                f"**Resolution:** {resolution_outcome.upper()}\n"
+                f"**Your Side:** {side.upper()}\n"
+                f"**Result:** {'✅ WIN' if is_winner else '❌ LOSS'}\n\n"
+                f"💰 **P&L Details:**\n"
+                f"• Entry Price: ${entry_price:.4f}\n"
+                f"• Settlement: ${exit_price:.2f}\n"
+                f"• Invested: ${amount:.2f}\n"
+                f"• Shares: {shares:.4f}\n"
+                f"• {pnl_emoji} Realized P&L: ${realized_pnl:+.2f}\n"
+            )
+            
+            if result.get("redemption_attempted"):
+                if result.get("redemption_success"):
+                    msg += f"\n🔄 **Token Redemption:** ✅ Success\n"
+                    msg += f"Tx: `{result.get('redemption_tx', 'N/A')[:20]}...`"
+                else:
+                    msg += f"\n🔄 **Token Redemption:** ❌ Failed\n"
+                    msg += f"Error: {result.get('redemption_error', 'Unknown')[:50]}"
+            
+            send_alert(msg)
+        
+        settlement_results.append(result)
+    
+    if settlement_results:
+        total_pnl = sum(r.get("realized_pnl", 0) for r in settlement_results)
+        wins = sum(1 for r in settlement_results if r.get("is_winner"))
+        losses = len(settlement_results) - wins
+        
+        logger.info(
+            f"Settlement check complete: {len(settlement_results)} positions settled. "
+            f"Wins: {wins}, Losses: {losses}, Total P&L: ${total_pnl:+.2f}"
+        )
+    
+    return settlement_results
+
+
+def force_settlement_check(send_alert: Callable = None) -> list:
+    """Force an immediate settlement check regardless of the interval.
+    
+    This bypasses the settlement interval check and runs immediately.
+    Useful for manual triggering via Telegram command.
+    
+    Args:
+        send_alert: Optional callback function to send Telegram alerts.
+    
+    Returns:
+        List of settlement results with P&L info.
+    """
+    global _last_settlement_check
+    
+    # Reset the last check time to force an immediate check
+    _last_settlement_check = 0
+    
+    return check_and_settle_positions(send_alert=send_alert)
+
+
+
     """Sell/exit a position by posting a sell order at market midpoint.
 
     Args:
@@ -2447,23 +2814,12 @@ def bot_loop(send_notification):
                     f"Tx: `{fund_result.get('tx', 'N/A')}`"
                 )
 
-            # Check for resolved markets and auto-calculate P&L
-            if not bot_config.get("dry_run", True):
-                try:
-                    resolved = check_resolved_markets(send_alert=send_notification)
-                    for result in resolved:
-                        pos = result.get("position", {})
-                        send_notification(
-                            f"📊 **Market Resolved**\n\n"
-                            f"Market: {result.get('market_question', 'N/A')[:50]}...\n"
-                            f"Resolution: {result.get('resolution', 'N/A').upper()}\n"
-                            f"Your Side: {pos.get('side', 'N/A').upper()}\n"
-                            f"Entry: ${pos.get('entry_price', 0):.4f}\n"
-                            f"Settlement: ${pos.get('exit_price', 0):.4f}\n"
-                            f"Realized P&L: ${pos.get('realized_pnl', 0):.2f}"
-                        )
-                except Exception as e:
-                    logger.error(f"Error checking resolved markets: {e}")
+            # Automatic position settlement tracking (every 30 minutes by default)
+            # Polls Gamma API for market resolution, calculates P&L, and optionally redeems tokens
+            try:
+                check_and_settle_positions(send_alert=send_notification)
+            except Exception as e:
+                logger.error(f"Error in settlement check: {e}")
 
             # Get prediction with multi-signal confidence
             pred = get_current_prediction()
@@ -2702,6 +3058,13 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 /positions - Offene Positionen anzeigen 📊
   (Auto-Exit bei Prediction-Flip, Auto-P&L bei Resolution)
 
+**Settlement Tracking:** 📊
+/settlement - Settlement-Tracking Status
+/settlement status - Detaillierter Status
+/settlement check - Sofortiger Check auf resolved Markets
+/settlement interval <min> - Check-Intervall setzen (Standard: 30 Min)
+/settlement redeem on|off - Auto Token-Redemption
+
 **Risk Management:** 🛡️
 /risk - Risiko-Status anzeigen
 /risk reset - Circuit Breaker zurücksetzen
@@ -2732,6 +3095,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 📊 **Multi-Signal Trading Engine:**
 Trades werden nur ausgeführt wenn Konfidenz ≥ Schwellenwert.
 Signale: MA Crossover + RSI(14) + MACD + Polymarket Delta
+
+⚙️ **Auto Settlement:**
+Alle 30 Min werden Positionen auf Resolution geprüft.
+Bei Resolution: P&L berechnet, Token eingelöst, Notification gesendet.
 
 ⚠️ **Sicherheitshinweise:**
 - Private Keys werden nur im Speicher gehalten
@@ -3099,7 +3466,175 @@ async def positions_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await update.message.reply_text(text, parse_mode="Markdown")
 
 
-async def config_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def settlement_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /settlement command - Check and settle resolved positions."""
+    if not is_authorized(update):
+        await unauthorized_response(update)
+        return
+
+    args = context.args if context.args else []
+
+    # Handle subcommands
+    if args and args[0].lower() == "status":
+        # Show settlement tracking status
+        interval = bot_config.get("settlement_check_interval", 1800)
+        auto_redeem = bot_config.get("auto_redeem_enabled", True)
+        dry_run = bot_config.get("dry_run", True)
+        
+        # Calculate time since last check
+        time_since_check = time.time() - _last_settlement_check
+        next_check_in = max(0, interval - time_since_check)
+        
+        open_positions = get_open_positions()
+        
+        await update.message.reply_text(
+            f"⚙️ **Settlement Tracking Status**\n\n"
+            f"**Configuration:**\n"
+            f"• Check Interval: {interval // 60} minutes\n"
+            f"• Auto Redeem Tokens: {'✅ Enabled' if auto_redeem else '❌ Disabled'}\n"
+            f"• Mode: {'🔴 Dry Run' if dry_run else '🟢 Live'}\n\n"
+            f"**Current State:**\n"
+            f"• Open Positions: {len(open_positions)}\n"
+            f"• Last Check: {int(time_since_check // 60)}m {int(time_since_check % 60)}s ago\n"
+            f"• Next Check In: {int(next_check_in // 60)}m {int(next_check_in % 60)}s\n\n"
+            f"**Commands:**\n"
+            f"`/settlement check` - Force immediate check\n"
+            f"`/settlement interval <minutes>` - Set check interval\n"
+            f"`/settlement redeem on|off` - Toggle auto redemption",
+            parse_mode="Markdown",
+        )
+        return
+
+    if args and args[0].lower() == "check":
+        # Force immediate settlement check
+        await update.message.reply_text(
+            "🔍 **Checking for resolved markets...**\n\n"
+            "This may take a moment.",
+            parse_mode="Markdown",
+        )
+
+        # Create a notification callback for this user
+        async def send_update(text: str):
+            try:
+                await update.message.reply_text(text, parse_mode="Markdown")
+            except Exception as e:
+                logger.error(f"Failed to send settlement update: {e}")
+
+        # Run settlement check - use synchronous call since we're in async context
+        # The notification callback will schedule async updates
+        loop = asyncio.get_event_loop()
+        
+        def sync_alert(text: str):
+            """Sync wrapper for async notification with error handling."""
+            future = asyncio.run_coroutine_threadsafe(send_update(text), loop)
+            try:
+                # Wait for result with timeout to catch errors
+                future.result(timeout=10)
+            except Exception as e:
+                logger.error(f"Error sending settlement notification: {e}")
+
+        try:
+            results = force_settlement_check(send_alert=sync_alert)
+            
+            if not results:
+                await update.message.reply_text(
+                    "✅ **Settlement Check Complete**\n\n"
+                    "No markets have resolved since last check.\n"
+                    "All open positions are still active.",
+                    parse_mode="Markdown",
+                )
+            else:
+                total_pnl = sum(r.get("realized_pnl", 0) for r in results)
+                wins = sum(1 for r in results if r.get("is_winner"))
+                losses = len(results) - wins
+                
+                await update.message.reply_text(
+                    f"✅ **Settlement Check Complete**\n\n"
+                    f"**Settled:** {len(results)} position(s)\n"
+                    f"**Wins:** {wins} | **Losses:** {losses}\n"
+                    f"**Total P&L:** ${total_pnl:+.2f}",
+                    parse_mode="Markdown",
+                )
+        except Exception as e:
+            await update.message.reply_text(
+                f"❌ **Settlement Check Failed**\n\n"
+                f"Error: {str(e)[:200]}",
+                parse_mode="Markdown",
+            )
+        return
+
+    if args and args[0].lower() == "interval" and len(args) >= 2:
+        # Set settlement check interval
+        try:
+            minutes = int(args[1])
+            if minutes < MIN_SETTLEMENT_INTERVAL_MINUTES or minutes > MAX_SETTLEMENT_INTERVAL_MINUTES:
+                await update.message.reply_text(
+                    f"❌ Interval must be between {MIN_SETTLEMENT_INTERVAL_MINUTES} and {MAX_SETTLEMENT_INTERVAL_MINUTES} minutes.",
+                    parse_mode="Markdown",
+                )
+                return
+            
+            bot_config["settlement_check_interval"] = minutes * 60
+            save_config()
+            
+            await update.message.reply_text(
+                f"✅ **Settlement interval set to {minutes} minutes**\n\n"
+                f"The bot will check for resolved markets every {minutes} minutes.",
+                parse_mode="Markdown",
+            )
+        except ValueError:
+            await update.message.reply_text(
+                "❌ Invalid interval. Please provide a number in minutes.\n"
+                "Example: `/settlement interval 30`",
+                parse_mode="Markdown",
+            )
+        return
+
+    if args and args[0].lower() == "redeem" and len(args) >= 2:
+        # Toggle auto redemption
+        value = args[1].lower()
+        if value in ("on", "true", "yes", "1"):
+            bot_config["auto_redeem_enabled"] = True
+            save_config()
+            await update.message.reply_text(
+                "✅ **Auto token redemption enabled**\n\n"
+                "Winning outcome tokens will be automatically redeemed when markets resolve.",
+                parse_mode="Markdown",
+            )
+        elif value in ("off", "false", "no", "0"):
+            bot_config["auto_redeem_enabled"] = False
+            save_config()
+            await update.message.reply_text(
+                "✅ **Auto token redemption disabled**\n\n"
+                "Winning outcome tokens will NOT be automatically redeemed.",
+                parse_mode="Markdown",
+            )
+        else:
+            await update.message.reply_text(
+                "❌ Invalid value. Use `on` or `off`.\n"
+                "Example: `/settlement redeem on`",
+                parse_mode="Markdown",
+            )
+        return
+
+    # Default: show help
+    await update.message.reply_text(
+        "📊 **Settlement Tracking**\n\n"
+        "Automatically polls Gamma API for market resolution status every 30 minutes.\n"
+        "When a market resolves, calculates P&L and sends notifications.\n\n"
+        "**Commands:**\n"
+        "`/settlement status` - Show tracking status\n"
+        "`/settlement check` - Force immediate check\n"
+        "`/settlement interval <min>` - Set check interval\n"
+        "`/settlement redeem on|off` - Toggle auto redemption\n\n"
+        "**Configuration:**\n"
+        f"• Current Interval: {bot_config.get('settlement_check_interval', 1800) // 60} minutes\n"
+        f"• Auto Redeem: {'Enabled' if bot_config.get('auto_redeem_enabled', True) else 'Disabled'}",
+        parse_mode="Markdown",
+    )
+
+
+
     """Handle /config command."""
     if not is_authorized(update):
         await unauthorized_response(update)
@@ -4696,6 +5231,7 @@ def main() -> None:
     application.add_handler(CommandHandler("scan", scan_command))
     application.add_handler(CommandHandler("pnl", pnl_command))
     application.add_handler(CommandHandler("positions", positions_command))
+    application.add_handler(CommandHandler("settlement", settlement_command))
     application.add_handler(CommandHandler("config", config_command))
     application.add_handler(CommandHandler("start_bot", start_bot_command))
     application.add_handler(CommandHandler("stop_bot", stop_bot_command))
