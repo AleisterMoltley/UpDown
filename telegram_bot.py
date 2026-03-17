@@ -188,11 +188,17 @@ WMATIC_ADDRESS = "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270"
 MAX_UINT256 = 2**256 - 1
 
 # Emergency Fund Settings
+# Null/Burn Address für Validierung
+NULL_ADDRESS = "0x0000000000000000000000000000000000000000"
 # Meds-Wallet Adresse für /emergency_fund Command (Placeholder - später setzen)
 MEDS_WALLET_ADDRESS = "0x0000000000000000000000000000000000000000"  # TODO: Set actual address
 # Auto MATIC Top-Up Threshold
 AUTO_MATIC_MIN_THRESHOLD = 0.15  # MATIC minimum before auto top-up
 AUTO_MATIC_TOPUP_SWAP_AMOUNT = 0.25  # USDC to swap to MATIC
+# Minimum Transfer Amount for emergency fund
+MIN_EMERGENCY_FUND_TRANSFER = 0.01  # Minimum USDC amount for transfer
+# Maximum gas fee multiplier (to avoid excessive fees during congestion)
+MAX_GAS_FEE_MULTIPLIER = 3
 
 # Settlement interval limits (in minutes)
 MIN_SETTLEMENT_INTERVAL_MINUTES = 5
@@ -1214,6 +1220,10 @@ def transfer_usdc(to_address: str, amount_usdc: float) -> dict:
         nonce = w3.eth.get_transaction_count(address)
         chain_id = bot_config.get("chain_id", 137)
         
+        # Calculate gas fee with cap to avoid excessive fees during congestion
+        base_gas_price = w3.eth.gas_price
+        max_fee = min(base_gas_price * 2, w3.to_wei(500, "gwei"))  # Cap at 500 gwei
+        
         tx = usdc_contract.functions.transfer(
             w3.to_checksum_address(to_address),
             amount_wei
@@ -1221,7 +1231,7 @@ def transfer_usdc(to_address: str, amount_usdc: float) -> dict:
             "from": address,
             "nonce": nonce,
             "gas": 100000,
-            "maxFeePerGas": w3.eth.gas_price * 2,
+            "maxFeePerGas": max_fee,
             "maxPriorityFeePerGas": w3.to_wei(30, "gwei"),
             "chainId": chain_id,
         })
@@ -5305,8 +5315,8 @@ async def emergency_fund_command(update: Update, context: ContextTypes.DEFAULT_T
         await unauthorized_response(update)
         return
 
-    # Check ob meds-wallet Adresse gesetzt ist
-    if MEDS_WALLET_ADDRESS == "0x0000000000000000000000000000000000000000":
+    # Check ob meds-wallet Adresse gesetzt ist (nicht die Null-Adresse)
+    if MEDS_WALLET_ADDRESS == NULL_ADDRESS:
         await update.message.reply_text(
             "❌ **Meds-Wallet nicht konfiguriert**\n\n"
             "Die Zieladresse für Emergency Fund ist noch nicht gesetzt.\n"
@@ -5344,10 +5354,11 @@ async def emergency_fund_command(update: Update, context: ContextTypes.DEFAULT_T
     # Calculate 10% of balance
     transfer_amount = current_balance * 0.10
     
-    if transfer_amount < 0.01:  # Minimum sinnvoller Betrag
+    if transfer_amount < MIN_EMERGENCY_FUND_TRANSFER:
         await update.message.reply_text(
             f"❌ **Betrag zu klein**\n\n"
             f"10% deines Guthabens (${transfer_amount:.4f}) ist zu klein für einen Transfer.\n"
+            f"Minimum: ${MIN_EMERGENCY_FUND_TRANSFER:.2f} USDC\n"
             f"Aktuelles Guthaben: ${current_balance:.2f} USDC",
             parse_mode="Markdown"
         )
@@ -5367,7 +5378,7 @@ async def emergency_fund_command(update: Update, context: ContextTypes.DEFAULT_T
     # Execute transfer in thread pool to not block
     loop = asyncio.get_event_loop()
     result = await loop.run_in_executor(
-        None, 
+        None,
         transfer_usdc, 
         MEDS_WALLET_ADDRESS, 
         transfer_amount
