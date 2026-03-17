@@ -797,11 +797,13 @@ def run_bot(
 
 
 if __name__ == "__main__":
-    # Run in dry-run mode unless credentials are fully configured.
-    _dry = not all([PRIVATE_KEY, API_KEY, API_SECRET, API_PASSPHRASE])
+    # Run in dry-run mode unless wallet private key is configured.
+    # 100% Onchain-Modus: Nur noch POLYMARKET_PRIVATE_KEY benötigt,
+    # L2-Credentials werden automatisch abgeleitet.
+    _dry = not PRIVATE_KEY
     if _dry:
         print(
-            "Note: One or more Polymarket credentials are missing. "
+            "Note: POLYMARKET_PRIVATE_KEY not set. "
             "Running in dry-run mode (no orders will be placed).\n"
         )
     run_bot(dry_run=_dry)
