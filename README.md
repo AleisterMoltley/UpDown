@@ -2,7 +2,9 @@
 
 A self-contained up/down prediction engine and trading bot for [Polymarket](https://polymarket.com), built without relying on third-party prediction services. Price data is sourced from the [CoinGecko](https://www.coingecko.com/) free API; market discovery uses Polymarket's public [Gamma API](https://gamma-api.polymarket.com); and order placement uses the official [py-clob-client](https://github.com/Polymarket/py-clob-client) SDK.
 
-**🎰 Now with 100% Telegram Control**: Control everything via Telegram commands - set wallets, start/stop trading, view balances, and configure settings without ever touching the server.
+**🔗 100% Onchain Mode (2026)**: Only your wallet private key is needed! L2 API credentials are automatically derived - no more manual API key setup.
+
+**🎰 100% Telegram Control**: Control everything via Telegram commands - set wallets, start/stop trading, view balances, and configure settings without ever touching the server.
 
 **⚡ Solana Auto-Funding**: Automatically bridge USDC from your Solana wallet to Polygon when your trading balance is low.
 
@@ -167,35 +169,46 @@ Now the fun part! Let's actually use this thing.
 
 Alright now, if you just wanna watch the predictions, you're done! But if you wanna actually trade on Polymarket, read on...
 
+**🎉 GOOD NEWS:** Since 2026, UpDown uses **100% Onchain Mode** - that means you ONLY need your wallet private key! No more messin' around with API keys, secrets, and passphrases. The bot figures all that out automatically. How cool is that?
+
 #### Step 5.1: Get Polymarket Set Up
 
 1. **Go to [polymarket.com](https://polymarket.com)**
 2. **Create an account** and set up your wallet
-3. **Get some USDC** (that's the cryptocurrency you trade with)
-4. **Go to their [API docs](https://docs.polymarket.com/)** and create API keys
-   - You'll get an API Key, API Secret, and Passphrase
-   - Write 'em all down!
+3. **Get some USDC** (that's the cryptocurrency you trade with on Polygon)
+4. **Make sure you got a little MATIC too** (for gas fees - the bot will remind ya if you're low)
 
-#### Step 5.2: Tell Your Bot Your Polymarket Stuff
+#### Step 5.2: Tell Your Bot Your Wallet Key
 
 You can do this right in Telegram! Just message your bot:
 
 1. **Send `/set_polygon_key`** - then paste your Polygon wallet private key
-2. **Send `/set_polymarket_api`** - then paste your API Key, Secret, and Passphrase (it'll ask for each one)
 
-**The bot will delete these messages right after reading 'em, so your secrets stay secret!**
+**That's it! Just ONE key!** The bot automatically derives all the API credentials it needs from your wallet. Magic! ✨
 
-#### Step 5.3: Start Actual Trading
+**The bot will delete your message right after reading it, so your secrets stay secret!**
+
+#### Step 5.3: Set Up Contract Approvals (First Time Only)
+
+Before your first trade, you need to approve the Polymarket contracts to use your USDC:
+
+1. **Send `/setup_approvals`** - this sets up the required token approvals
+2. **Wait for confirmation** - the bot will tell you when it's done
+
+You only gotta do this once! After that, you're good to go.
+
+#### Step 5.4: Start Actual Trading
 
 1. **Send `/toggle_dry_run`** to turn OFF dry run mode (this enables REAL trading!)
 2. **Send `/set_trade_amount`** to set how much you wanna bet each time
-3. **Send `/start_bot`** to start the automated trading loop
+3. **Send `/gas_status`** to make sure you got enough MATIC for gas
+4. **Send `/start_bot`** to start the automated trading loop
 
 **That's it! Your bot will now:**
 - Check Bitcoin prices every 5 minutes
 - Make predictions (up or down)
 - Find matching markets on Polymarket
-- Place bets automatically
+- Place bets automatically (100% onchain - no middleman!)
 
 ---
 
@@ -319,11 +332,13 @@ Control the entire bot via Telegram - no server access needed after initial setu
 | `/toggle_dry_run` | Switch between dry run and live trading |
 | `/set_solana_key` | Set Solana wallet (securely via DM) |
 | `/set_polygon_key` | Set Polygon wallet (securely via DM) |
-| `/set_polymarket_api` | Set Polymarket API credentials |
 | `/set_trade_amount` | Configure trade size |
 | `/set_min_balance` | Set minimum Polygon balance for auto-funding |
 | `/set_bridge_amount` | Set amount to bridge when auto-funding |
 | `/set_interval` | Set cycle interval |
+| `/setup_approvals` | Set up USDC/CTF token approvals for trading |
+| `/gas_status` | Check MATIC balance for gas fees |
+| `/toggle_onchain` | Toggle 100% onchain trading mode |
 | `/help` | Show all commands |
 
 ### Security Features
@@ -332,6 +347,7 @@ Control the entire bot via Telegram - no server access needed after initial setu
 - **Secure Key Input**: Private keys are deleted from chat history immediately
 - **Memory-Only Storage**: Sensitive credentials are stored in memory only, not on disk
 - **Dry Run Default**: Bot starts in dry-run mode - must explicitly enable live trading
+- **100% Onchain**: All trades execute directly on Polygon - no centralized API dependencies
 
 ---
 
@@ -343,7 +359,7 @@ Control the entire bot via Telegram - no server access needed after initial setu
    - Returns `"up"` when the current fast MA is above the current slow MA (bullish), `"down"` otherwise (bearish).
    - Returns `"hold"` when there is insufficient data.
 3. **Market Discovery** – Queries Polymarket's Gamma API for active, unclosed markets whose `question` contains your search terms (e.g. current date + "btc").
-4. **Trade Execution** – Optionally places a limit order (yes/no) on each matched market via the CLOB client. Automatically skips trading when credentials are absent (dry-run mode).
+4. **Trade Execution** – Places trades 100% onchain via the CLOB client. L2 API credentials are automatically derived from your wallet private key (no manual API setup needed!). Automatically skips trading when credentials are absent (dry-run mode).
 5. **Solana Auto-Funding** – Before each cycle, checks your Polygon balance and automatically bridges USDC from Solana if below threshold.
 6. **Loop** – Repeats every 5 minutes (configurable via `CYCLE_INTERVAL_SECONDS`).
 
@@ -371,17 +387,17 @@ cp .env.example .env
 
 | Variable | Description |
 |---|---|
-| `POLYMARKET_PRIVATE_KEY` | Your Polygon wallet private key |
-| `POLYMARKET_API_KEY` | Polymarket CLOB API key |
-| `POLYMARKET_API_SECRET` | Polymarket CLOB API secret |
-| `POLYMARKET_API_PASSPHRASE` | Polymarket CLOB API passphrase |
+| `POLYMARKET_PRIVATE_KEY` | Your Polygon wallet private key (only key needed!) |
 | `POLYMARKET_HOST` | CLOB endpoint (default: `https://clob.polymarket.com`) |
 | `POLYMARKET_CHAIN_ID` | Polygon chain ID (default: `137`) |
+| `POLYGON_RPC_URL` | Polygon RPC endpoint (default: `https://polygon-rpc.com`) |
 | `CYCLE_INTERVAL_SECONDS` | Seconds between cycles (default: `300`) |
 | `SHORT_WINDOW` | Fast MA period (default: `5`) |
 | `LONG_WINDOW` | Slow MA period (default: `20`) |
 
-Follow [Polymarket's quickstart docs](https://docs.polymarket.com/) to generate API credentials and fund your wallet with USDC on Polygon.
+> **💡 100% Onchain Mode:** Since 2026, you only need the `POLYMARKET_PRIVATE_KEY`! The bot automatically derives all required L2 API credentials from your wallet using `signature_type=0` (EOA mode). No more separate API key, secret, and passphrase needed!
+
+Fund your wallet with USDC on Polygon for trading and a small amount of MATIC for gas fees.
 
 ### 3. Run the bot
 
@@ -392,7 +408,7 @@ export $(grep -v '^#' .env | xargs)
 python updown_bot.py
 ```
 
-If any credential variable is missing the bot runs in **dry-run mode** – it logs predictions and matched markets but never submits orders.
+If `POLYMARKET_PRIVATE_KEY` is missing, the bot runs in **dry-run mode** – it logs predictions and matched markets but never submits orders.
 
 ---
 
