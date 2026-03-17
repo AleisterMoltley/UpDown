@@ -3882,10 +3882,17 @@ def check_and_fund_polygon() -> dict:
 
 
 def bot_loop(send_notification):
-    """Main bot trading loop (runs in separate thread)."""
+    """Main bot trading loop (runs in separate thread).
+    
+    Scanner-First Logic:
+    1. Call get_top_mispriced_markets(count=8, min_deviation_pct=12, prioritize_politics=True)
+    2. For each market, calculate signal confidence and filter where signal direction matches deviation direction
+    3. Select top-1 with highest (deviation_pct * confidence) 
+    4. Trade only when combined_score > 75
+    """
     global stop_event
 
-    logger.info("Bot loop started")
+    logger.info("Bot loop started – Scanner Mode active – searching mispriced")
 
     # Track previous prediction for flip detection
     previous_prediction = None
@@ -3915,65 +3922,6 @@ def bot_loop(send_notification):
             except Exception as e:
                 logger.error(f"Error in settlement check: {e}")
 
-            # Get prediction with multi-signal confidence
-            pred = get_current_prediction()
-            prediction = pred.get("prediction", "hold")
-            confidence = pred.get("confidence", 0)
-            meets_threshold = pred.get("meets_threshold", False)
-            min_threshold = pred.get("min_threshold", 68)
-
-            if prediction == "hold":
-                # Skip the cycle but don't update previous_prediction
-                # This way, "hold" states are transparent to flip detection
-                logger.info("Not enough data - skipping trade")
-                wait_with_check(bot_config.get("cycle_interval_seconds", 300))
-                continue
-
-            # Log signal details
-            signals = pred.get("signals", {})
-            logger.info(
-                f"Prediction: {prediction.upper()} | Confidence: {confidence:.1f}% | "
-                f"Threshold: {min_threshold}% | Trade: {'YES' if meets_threshold else 'NO'}"
-            )
-
-            # Check for prediction flip and exit positions if needed
-            # Note: Because "hold" states are skipped above, previous_prediction
-            # always holds the last directional prediction ("up" or "down").
-            # Transitions like "up" → "hold" → "down" trigger exits when "down" arrives.
-            if not bot_config.get("dry_run", True):
-                if previous_prediction is not None and previous_prediction != prediction:
-                    logger.info(f"Prediction flipped: {previous_prediction} → {prediction}")
-                    try:
-                        check_prediction_flip_and_exit(prediction, send_notification)
-                    except Exception as e:
-                        logger.error(f"Error during prediction flip exit: {e}")
-
-            previous_prediction = prediction
-
-            # Check if confidence meets threshold for trading
-            if not meets_threshold:
-                logger.info(
-                    f"Confidence {confidence:.1f}% below threshold {min_threshold}% - skipping trade"
-                )
-                # Send notification about skipped trade
-                logreg_info = pred.get("logreg_prediction")
-                logreg_text = ""
-                if logreg_info:
-                    logreg_text = f"\n• LogReg: {logreg_info.get('direction', 'N/A').upper()} ({logreg_info.get('confidence', 0):.0f}%)"
-                send_notification(
-                    f"⏸️ **Trade Skipped - Low Confidence**\n\n"
-                    f"Prediction: {prediction.upper()}\n"
-                    f"Confidence: {confidence:.1f}%\n"
-                    f"Required: ≥{min_threshold}%\n\n"
-                    f"📊 **Signals:**\n"
-                    f"• MA: {signals.get('ma_crossover', {}).get('direction', 'N/A').upper()}\n"
-                    f"• RSI: {signals.get('rsi', {}).get('rsi', 0):.1f}\n"
-                    f"• MACD: {signals.get('macd', {}).get('direction', 'N/A').upper()}"
-                    f"{logreg_text}"
-                )
-                wait_with_check(bot_config.get("cycle_interval_seconds", 300))
-                continue
-
             # Check risk limits before looking for markets (for live trading only)
             if not bot_config.get("dry_run", True):
                 trade_amount = bot_config.get("trade_amount", 5.0)
@@ -3986,116 +3934,246 @@ def bot_loop(send_notification):
                     wait_with_check(bot_config.get("cycle_interval_seconds", 300))
                     continue
 
-            # Find top 3 mispriced markets (crypto, politics, economics)
-            markets = find_relevant_markets(count=8, min_deviation_pct=12.0)[:3]
+            # ============================================================
+            # SCANNER-FIRST LOGIC
+            # ============================================================
+            
+            # Step 1: Call get_top_mispriced_markets with Scanner-First parameters
+            logger.info("Scanner Mode active – searching mispriced")
+            mispriced_markets = get_top_mispriced_markets(
+                count=8,
+                min_deviation_pct=12,
+                prioritize_politics=True,
+            )
 
-            if not markets:
+            if not mispriced_markets:
                 logger.info("No mispriced markets found")
                 wait_with_check(bot_config.get("cycle_interval_seconds", 300))
                 continue
 
-            # Execute trades with confidence + deviation_pct bonus
-            for market in markets:
-                # Get deviation data for extra confidence
+            logger.info(f"Found {len(mispriced_markets)} mispriced markets")
+
+            # Get price data for signal calculation
+            try:
+                crypto_id = bot_config.get("crypto_id", "bitcoin")
+                ohlc = fetch_5min_data(crypto_id=crypto_id)
+                closes = [candle[4] for candle in ohlc]
+            except Exception as e:
+                logger.error(f"Error fetching price data: {e}")
+                wait_with_check(bot_config.get("cycle_interval_seconds", 300))
+                continue
+
+            # Step 2: Filter markets where signal direction matches deviation direction
+            # and calculate combined_score = deviation_pct * confidence
+            candidates = []
+            for market in mispriced_markets:
                 price_deviation = market.get("price_deviation", {})
                 deviation_pct = abs(price_deviation.get("deviation_pct", 0))
-                direction = price_deviation.get("direction", "unknown")
-                category = market.get("category", "other")
-                current_price = price_deviation.get("current_price", 0.5)
-                historical_mean = price_deviation.get("historical_mean", 0.5)
+                deviation_direction = price_deviation.get("direction", "unknown")
+                
+                # Skip markets with unknown deviation direction
+                if deviation_direction == "unknown":
+                    logger.info(
+                        f"Market '{market.get('question', 'N/A')[:40]}...' - "
+                        f"SKIPPED: Unknown deviation direction"
+                    )
+                    continue
+                
+                # Map deviation direction to signal direction:
+                # - "underpriced" means price is below historical mean → expect price to go UP → signal should be "up"
+                # - "overpriced" means price is above historical mean → expect price to go DOWN → signal should be "down"
+                expected_signal_direction = "up" if deviation_direction == "underpriced" else "down"
+                
+                # Calculate confidence for this market using the multi-signal engine
+                # Pass signed_deviation_pct to include Polymarket deviation in signal calculation
+                # Note: This is the signed value (can be negative), not the absolute percentage
+                signed_deviation_pct = price_deviation.get("deviation_pct", 0)
+                confidence_result = calculate_confidence(
+                    closes,
+                    market_price_deviation=signed_deviation_pct,
+                    market=market,
+                )
+                
+                signal_direction = confidence_result.get("direction", "hold")
+                confidence = confidence_result.get("confidence_score", confidence_result.get("confidence", 0))
+                
+                # Only include markets where signal direction matches expected direction from deviation
+                if signal_direction == expected_signal_direction:
+                    # Calculate combined_score = deviation_pct * confidence
+                    combined_score = deviation_pct * confidence
+                    candidates.append({
+                        "market": market,
+                        "deviation_pct": deviation_pct,
+                        "deviation_direction": deviation_direction,
+                        "signal_direction": signal_direction,
+                        "confidence": confidence,
+                        "combined_score": combined_score,
+                        "confidence_result": confidence_result,
+                    })
+                    logger.info(
+                        f"Market '{market.get('question', 'N/A')[:40]}...' - "
+                        f"Deviation: {deviation_pct:.1f}% ({deviation_direction}), "
+                        f"Signal: {signal_direction}, Confidence: {confidence:.1f}%, "
+                        f"Combined Score: {combined_score:.1f}"
+                    )
+                else:
+                    logger.info(
+                        f"Market '{market.get('question', 'N/A')[:40]}...' - "
+                        f"SKIPPED: Signal direction ({signal_direction}) doesn't match "
+                        f"deviation direction ({deviation_direction} → expected {expected_signal_direction})"
+                    )
 
-                # Calculate total confidence (base confidence + deviation bonus)
-                # Formula: deviation_pct / 2.0, capped at 15%
-                # Example: 30% deviation → 15% bonus (max), 20% deviation → 10% bonus
-                # This rewards trading in highly mispriced markets while limiting risk
-                deviation_bonus = min(15.0, deviation_pct / 2.0)
-                total_confidence = min(100.0, confidence + deviation_bonus)
+            if not candidates:
+                logger.info("No markets with matching signal/deviation direction found")
+                wait_with_check(bot_config.get("cycle_interval_seconds", 300))
+                continue
 
-                # Build LogReg info string
-                logreg_info = pred.get("logreg_prediction")
+            # Step 3: Select top-1 with highest combined_score
+            candidates.sort(key=lambda x: x["combined_score"], reverse=True)
+            best_candidate = candidates[0]
+            
+            market = best_candidate["market"]
+            deviation_pct = best_candidate["deviation_pct"]
+            deviation_direction = best_candidate["deviation_direction"]
+            signal_direction = best_candidate["signal_direction"]
+            confidence = best_candidate["confidence"]
+            combined_score = best_candidate["combined_score"]
+            confidence_result = best_candidate["confidence_result"]
+            signals = confidence_result.get("signals", {})
+
+            logger.info(
+                f"Selected best market: '{market.get('question', 'N/A')[:50]}...' "
+                f"with combined_score: {combined_score:.1f}"
+            )
+
+            # Step 4: Trade only when combined_score > 75
+            if combined_score <= 75:
+                logger.info(f"Combined score {combined_score:.1f} <= 75 - skipping trade")
+                logreg_info = confidence_result.get("logreg_prediction")
                 logreg_text = ""
                 if logreg_info:
                     logreg_text = f"\n• LogReg: {logreg_info.get('direction', 'N/A').upper()} ({logreg_info.get('confidence', 0):.0f}%)"
+                send_notification(
+                    f"⏸️ **Trade Skipped - Low Combined Score**\n\n"
+                    f"Market: {market.get('question', 'N/A')[:50]}...\n"
+                    f"📈 Deviation: {deviation_pct:.1f}% ({deviation_direction})\n"
+                    f"🎯 Signal: {signal_direction.upper()}\n"
+                    f"Confidence: {confidence:.1f}%\n"
+                    f"Combined Score: {combined_score:.1f}\n"
+                    f"Required: > 75\n\n"
+                    f"📊 **Signals:**\n"
+                    f"• MA: {signals.get('ma_crossover', {}).get('direction', 'N/A').upper()}\n"
+                    f"• RSI: {signals.get('rsi', {}).get('rsi', 0):.1f}\n"
+                    f"• MACD: {signals.get('macd', {}).get('direction', 'N/A').upper()}"
+                    f"{logreg_text}"
+                )
+                wait_with_check(bot_config.get("cycle_interval_seconds", 300))
+                continue
 
-                if bot_config.get("dry_run", True):
-                    outcome = "YES" if prediction == "up" else "NO"
-                    # Calculate Kelly size for dry run display using backtest-based formula
-                    current_balance = get_polygon_balance()
-                    base_trade_amount = bot_config.get("trade_amount", 5.0)
-                    kelly_result = calc_kelly_size(
-                        confidence=total_confidence,
-                        balance=current_balance,
-                        base_trade_amount=base_trade_amount,
-                    )
-                    kelly_size = kelly_result["size"]
-                    kelly_edge = kelly_result["edge"]
-                    
-                    logger.info(f"[Dry run] Would buy {outcome} on {market.get('question')}")
+            # Check for prediction flip and exit positions if needed
+            if not bot_config.get("dry_run", True):
+                if previous_prediction is not None and previous_prediction != signal_direction:
+                    logger.info(f"Prediction flipped: {previous_prediction} → {signal_direction}")
+                    try:
+                        check_prediction_flip_and_exit(signal_direction, send_notification)
+                    except Exception as e:
+                        logger.error(f"Error during prediction flip exit: {e}")
+
+            previous_prediction = signal_direction
+
+            # Get market data
+            price_deviation = market.get("price_deviation", {})
+            category = market.get("category", "other")
+            current_price = price_deviation.get("current_price", 0.5)
+            historical_mean = price_deviation.get("historical_mean", 0.5)
+
+            # Build LogReg info string
+            logreg_info = confidence_result.get("logreg_prediction")
+            logreg_text = ""
+            if logreg_info:
+                logreg_text = f"\n• LogReg: {logreg_info.get('direction', 'N/A').upper()} ({logreg_info.get('confidence', 0):.0f}%)"
+
+            # Execute trade
+            if bot_config.get("dry_run", True):
+                outcome = "YES" if signal_direction == "up" else "NO"
+                # Calculate Kelly size for dry run display using backtest-based formula
+                current_balance = get_polygon_balance()
+                base_trade_amount = bot_config.get("trade_amount", 5.0)
+                kelly_result = calc_kelly_size(
+                    confidence=confidence,
+                    balance=current_balance,
+                    base_trade_amount=base_trade_amount,
+                )
+                kelly_size = kelly_result["size"]
+                kelly_edge = kelly_result["edge"]
+                
+                logger.info(f"[Dry run] Would buy {outcome} on {market.get('question')}")
+                send_notification(
+                    f"📊 **Dry Run Trade (Scanner-First)**\n"
+                    f"Market: {market.get('question', 'N/A')[:50]}...\n"
+                    f"🏷️ Category: {category.capitalize()}\n"
+                    f"🎯 Signal: {signal_direction.upper()}\n"
+                    f"📈 Deviation: {deviation_pct:.1f}% ({deviation_direction})\n"
+                    f"Confidence: {confidence:.1f}%\n"
+                    f"🔥 Combined Score: {combined_score:.1f}\n"
+                    f"Would buy: {outcome}\n"
+                    f"💰 Kelly Size: ${kelly_size:.2f} (edge {kelly_edge:.2f}%)\n"
+                    f"Balance: ${current_balance:.2f}\n\n"
+                    f"📊 **Market Data:**\n"
+                    f"• Current Price: {current_price:.2%}\n"
+                    f"• Historical Mean: {historical_mean:.2%}\n\n"
+                    f"📊 **Signals:**\n"
+                    f"• MA: {signals.get('ma_crossover', {}).get('direction', 'N/A').upper()} "
+                    f"({signals.get('ma_crossover', {}).get('strength', 0):.0f}%)\n"
+                    f"• RSI: {signals.get('rsi', {}).get('rsi', 0):.1f} "
+                    f"({signals.get('rsi', {}).get('direction', 'N/A').upper()})\n"
+                    f"• MACD: {signals.get('macd', {}).get('direction', 'N/A').upper()} "
+                    f"(hist: {signals.get('macd', {}).get('histogram', 0):.2f})\n"
+                    f"• PM Delta: {signals.get('polymarket_delta', {}).get('delta', 0):.3f}"
+                    f"{logreg_text}"
+                )
+            else:
+                outcome = "yes" if signal_direction == "up" else "no"
+                
+                # Calculate Kelly-optimized position size using backtest-based formula
+                current_balance = get_polygon_balance()
+                base_trade_amount = bot_config.get("trade_amount", 5.0)
+                kelly_result = calc_kelly_size(
+                    confidence=confidence,
+                    balance=current_balance,
+                    base_trade_amount=base_trade_amount,
+                )
+                kelly_size = kelly_result["size"]
+                kelly_edge = kelly_result["edge"]
+                
+                result = place_trade(
+                    market,
+                    outcome=outcome,
+                    amount=kelly_size,
+                    send_alert=send_notification,
+                )
+
+                if result.get("success"):
                     send_notification(
-                        f"📊 **Dry Run Trade**\n"
+                        f"✅ **Trade Executed (Scanner-First)**\n"
                         f"Market: {market.get('question', 'N/A')[:50]}...\n"
                         f"🏷️ Category: {category.capitalize()}\n"
-                        f"Prediction: {prediction.upper()}\n"
-                        f"Base Confidence: {confidence:.1f}%\n"
-                        f"📈 Deviation: {deviation_pct:.1f}% ({direction})\n"
-                        f"🎯 Total Confidence: {total_confidence:.1f}%\n"
-                        f"Would buy: {outcome}\n"
+                        f"Side: {outcome.upper()}\n"
+                        f"🎯 Signal: {signal_direction.upper()}\n"
+                        f"📈 Deviation: {deviation_pct:.1f}% ({deviation_direction})\n"
+                        f"Confidence: {confidence:.1f}%\n"
+                        f"🔥 Combined Score: {combined_score:.1f}\n"
                         f"💰 Kelly Size: ${kelly_size:.2f} (edge {kelly_edge:.2f}%)\n"
-                        f"Balance: ${current_balance:.2f}\n\n"
-                        f"📊 **Market Data:**\n"
-                        f"• Current Price: {current_price:.2%}\n"
-                        f"• Historical Mean: {historical_mean:.2%}\n\n"
-                        f"📊 **Signals:**\n"
-                        f"• MA: {signals.get('ma_crossover', {}).get('direction', 'N/A').upper()} "
-                        f"({signals.get('ma_crossover', {}).get('strength', 0):.0f}%)\n"
-                        f"• RSI: {signals.get('rsi', {}).get('rsi', 0):.1f} "
-                        f"({signals.get('rsi', {}).get('direction', 'N/A').upper()})\n"
-                        f"• MACD: {signals.get('macd', {}).get('direction', 'N/A').upper()} "
-                        f"(hist: {signals.get('macd', {}).get('histogram', 0):.2f})\n"
-                        f"• PM Delta: {signals.get('polymarket_delta', {}).get('delta', 0):.3f}"
+                        f"Balance: ${current_balance:.2f}\n"
+                        f"Price: {result.get('price', 'N/A')}"
                         f"{logreg_text}"
                     )
                 else:
-                    outcome = "yes" if prediction == "up" else "no"
-                    
-                    # Calculate Kelly-optimized position size using backtest-based formula
-                    current_balance = get_polygon_balance()
-                    base_trade_amount = bot_config.get("trade_amount", 5.0)
-                    kelly_result = calc_kelly_size(
-                        confidence=total_confidence,
-                        balance=current_balance,
-                        base_trade_amount=base_trade_amount,
+                    send_notification(
+                        f"❌ **Trade Failed**\n"
+                        f"Market: {market.get('question', 'N/A')[:50]}...\n"
+                        f"Error: {result.get('error', 'Unknown')}"
                     )
-                    kelly_size = kelly_result["size"]
-                    kelly_edge = kelly_result["edge"]
-                    
-                    result = place_trade(
-                        market,
-                        outcome=outcome,
-                        amount=kelly_size,
-                        send_alert=send_notification,
-                    )
-
-                    if result.get("success"):
-                        send_notification(
-                            f"✅ **Trade Executed**\n"
-                            f"Market: {market.get('question', 'N/A')[:50]}...\n"
-                            f"🏷️ Category: {category.capitalize()}\n"
-                            f"Side: {outcome.upper()}\n"
-                            f"Base Confidence: {confidence:.1f}%\n"
-                            f"📈 Deviation: {deviation_pct:.1f}% ({direction})\n"
-                            f"🎯 Total Confidence: {total_confidence:.1f}%\n"
-                            f"💰 Kelly Size: ${kelly_size:.2f} (edge {kelly_edge:.2f}%)\n"
-                            f"Balance: ${current_balance:.2f}\n"
-                            f"Price: {result.get('price', 'N/A')}"
-                            f"{logreg_text}"
-                        )
-                    else:
-                        send_notification(
-                            f"❌ **Trade Failed**\n"
-                            f"Market: {market.get('question', 'N/A')[:50]}...\n"
-                            f"Error: {result.get('error', 'Unknown')}"
-                        )
 
             # Wait for next cycle
             wait_with_check(bot_config.get("cycle_interval_seconds", 300))
@@ -5614,9 +5692,13 @@ async def start_bot_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     mode = "🧪 Dry Run" if bot_config.get("dry_run", True) else "💰 Live Trading"
 
+    # Log Scanner Mode activation
+    logger.info("Scanner Mode active – searching mispriced")
+
     await update.message.reply_text(
         f"▶️ **Bot Started**\n\n"
         f"Mode: {mode}\n"
+        f"🔍 Scanner Mode active – searching mispriced\n"
         f"Interval: {bot_config.get('cycle_interval_seconds', 300)}s\n"
         f"Trade Amount: ${bot_config.get('trade_amount', 5.0)}\n\n"
         f"Use /stop_bot to stop.",
