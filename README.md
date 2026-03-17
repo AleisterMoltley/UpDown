@@ -324,11 +324,16 @@ Control the entire bot via Telegram - no server access needed after initial setu
 | `/balance` | View Solana and Polygon wallet balances |
 | `/predict` | Get current price prediction |
 | `/markets` | Find relevant Polymarket markets |
+| `/scan` | 🔍 Scan ALL active markets for mispriced opportunities |
+| `/politics_scan` | 🗳️ Scan politics markets specifically |
 | `/start_bot` | Start the automated trading loop |
 | `/stop_bot` | Stop the trading loop |
 | `/trade` | Execute a manual trade |
 | `/bridge` | Manually bridge Solana → Polygon |
 | `/pnl` | View P&L history |
+| `/positions` | 📊 View open positions and P&L |
+| `/settlement` | 🔄 Manually check and settle resolved markets |
+| `/risk` | ⚠️ View/configure risk management settings |
 | `/config` | View/edit bot settings |
 | `/toggle_dry_run` | Switch between dry run and live trading |
 | `/set_solana_key` | Set Solana wallet (securely via DM) |
@@ -337,10 +342,14 @@ Control the entire bot via Telegram - no server access needed after initial setu
 | `/set_min_balance` | Set minimum Polygon balance for auto-funding |
 | `/set_bridge_amount` | Set amount to bridge when auto-funding |
 | `/set_interval` | Set cycle interval |
+| `/set_confidence_threshold` | Set minimum confidence threshold (0-100) |
+| `/set_rsi_params` | Configure RSI parameters (period overbought oversold) |
+| `/set_macd_params` | Configure MACD parameters (fast slow signal) |
 | `/setup_approvals` | Set up USDC/CTF token approvals for trading |
 | `/gas_status` | Check MATIC balance for gas fees |
 | `/toggle_onchain` | Toggle 100% onchain trading mode |
-| `/backtest` | Run 30-day backtest with 1000 trades |
+| `/backtest` | Run 30-day backtest with Walk-Forward Optimization |
+| `/emergency_fund` | 🚨 Transfer 10% of USDC balance to emergency wallet |
 | `/help` | Show all commands |
 
 ### Security Features
@@ -350,20 +359,24 @@ Control the entire bot via Telegram - no server access needed after initial setu
 - **Memory-Only Storage**: Sensitive credentials are stored in memory only, not on disk
 - **Dry Run Default**: Bot starts in dry-run mode - must explicitly enable live trading
 - **100% Onchain**: All trades execute directly on Polygon - no centralized API dependencies
+- **Risk Management**: Configurable daily loss limits, position size limits, and circuit breakers
 
 ---
 
 ## 📊 How It Works
 
 1. **Data Fetching** – Pulls the last 24 h of 5-minute OHLC candles for Bitcoin (or any CoinGecko asset) via `pycoingecko`.
-2. **Up/Down Engine** – A custom moving-average comparator:
+2. **Multi-Signal Engine** – A sophisticated signal combination system:
    - Computes a 5-period (fast) and 20-period (slow) simple moving average over recent closing prices (configurable via env vars).
-   - Returns `"up"` when the current fast MA is above the current slow MA (bullish), `"down"` otherwise (bearish).
-   - Returns `"hold"` when there is insufficient data.
-3. **Market Discovery** – Queries Polymarket's Gamma API for active, unclosed markets whose `question` contains your search terms (e.g. current date + "btc").
-4. **Trade Execution** – Places trades 100% onchain via the CLOB client. L2 API credentials are automatically derived from your wallet private key (no manual API setup needed!). Automatically skips trading when credentials are absent (dry-run mode).
-5. **Solana Auto-Funding** – Before each cycle, checks your Polygon balance and automatically bridges USDC from Solana if below threshold.
-6. **Loop** – Repeats every 5 minutes (configurable via `CYCLE_INTERVAL_SECONDS`).
+   - Combines MA crossover, RSI, MACD, momentum, and volume momentum signals with configurable weights.
+   - Returns `"up"` when confidence is bullish above threshold, `"down"` when bearish above threshold.
+   - Returns `"hold"` when there is insufficient data or confidence below threshold.
+3. **Market Discovery** – Queries Polymarket's Gamma API for active, unclosed markets whose `question` contains your search terms (e.g. current date + "btc"). The market scanner (`/scan`) extends this to find mispriced opportunities across all categories (crypto, politics, sports, etc.).
+4. **Trade Execution** – Places trades 100% onchain via the CLOB client. L2 API credentials are automatically derived from your wallet private key (no manual API setup needed!). Uses Kelly Criterion for optimal position sizing with orderbook edge detection.
+5. **Position Tracking** – Tracks all open positions with entry price, amount, and timestamp. Automatically settles resolved markets and redeems winning tokens.
+6. **Solana Auto-Funding** – Before each cycle, checks your Polygon balance and automatically bridges USDC from Solana if below threshold.
+7. **Auto MATIC Top-Up** – Automatically swaps USDC to MATIC for gas fees when balance is low and last trade was profitable.
+8. **Loop** – Repeats every 5 minutes (configurable via `CYCLE_INTERVAL_SECONDS`).
 
 ---
 
@@ -456,25 +469,72 @@ The bot can automatically bridge USDC from your Solana wallet to your Polygon ad
 - **Trade size** – Use `/set_trade_amount` in Telegram or set in config.
 - **Auto-funding** – Configure `MIN_POLY_BALANCE_USDC` and `BRIDGE_FUND_AMOUNT` via Telegram or env vars.
 - **Multi-Signal Engine** – The bot uses a weighted signal combination:
-  - MA Crossover (30% weight)
-  - RSI (14) with Overbought/Oversold detection (30% weight)
-  - MACD (12, 26, 9) (25% weight)
-  - Polymarket price deviation (15% weight)
+  - MA Crossover (27% weight)
+  - RSI (14) with Overbought/Oversold detection (27% weight)
+  - MACD (12, 26, 9) (23% weight)
+  - Momentum (13% weight)
+  - Volume Momentum (10% weight)
 - **Logistic Regression Fallback** – A simple numpy-based LogReg model trained on-the-fly using 7 days of CoinGecko historical data provides additional confirmation signals.
 - **Confidence Threshold** – Set minimum confidence (default: 68%) via `/set_confidence_threshold`. Trades are only executed when confidence ≥ threshold.
+- **Kelly Criterion Position Sizing** – Optimal position sizing based on edge and win probability, with a 0.5% slippage buffer.
+- **Orderbook Edge** – Detects orderbook imbalances (>15%) and applies a 0.5% price edge when favorable.
+
+---
+
+## 🎯 Backtesting
+
+The bot includes a comprehensive backtesting module with Walk-Forward Optimization (WFO):
+
+- **30-day historical data** from CoinGecko interpolated to 5-minute candles
+- **Walk-Forward Optimization** splits data into 5 training windows + 1 test window to avoid lookahead bias
+- **Parameter optimization** for SHORT_WINDOW, LONG_WINDOW, and RSI thresholds
+- **Metrics calculated**: Winrate, Profit Factor, Max Drawdown, Sharpe Ratio
+- **Results saved** to `daily_pnl.json` and optimized parameters to `bot_config.json`
+
+Run via Telegram with `/backtest` or compare live vs. backtest performance with `/status`.
+
+---
+
+## ⚠️ Risk Management
+
+The bot includes comprehensive risk management features configurable via `/risk`:
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `max_daily_loss` | $25 | Maximum daily loss before pausing trading |
+| `max_position_size_pct` | 10% | Maximum position size as percentage of balance |
+| `max_concurrent_positions` | 5 | Maximum number of concurrent open positions |
+| `circuit_breaker_consecutive_losses` | 3 | Pause after N consecutive losing trades |
+
+---
+
+## 📊 Position & Settlement Tracking
+
+The bot automatically tracks all open positions and handles market settlements:
+
+- **Position Storage**: Stores market_id, token_id, side, entry_price, amount, timestamp in `positions.json`
+- **Settlement Polling**: Checks Gamma API every 30 minutes (configurable via `settlement_check_interval` in `/config` or bot_config.json)
+- **Auto Redemption**: Automatically redeems winning CTF tokens when `auto_redeem_enabled=True`
+- **P&L Calculation**: Automatic profit/loss calculation on market resolution
+- **Prediction Flip Exit**: Auto-exits positions when prediction flips direction
 
 ---
 
 ## 📁 File Structure
 
 ```
-telegram_bot.py    NEW: Full Telegram-controlled bot with all features
+telegram_bot.py    Full Telegram-controlled bot with all features
 updown_bot.py      Classic CLI bot: prediction engine + trading loop + Solana funding
+backtest.py        Backtesting module with Walk-Forward Optimization
+market_scanner.py  Market scanner for finding mispriced opportunities across categories
 requirements.txt   Python dependencies (includes python-telegram-bot)
 .env.example       Template for environment variables (copy to .env)
 .gitignore         Excludes secrets, venvs, and build artefacts
+railway.json       Railway deployment configuration
 bot_config.json    Auto-generated: Non-sensitive bot configuration (gitignored)
-daily_pnl.json     Auto-generated: P&L tracking data
+daily_pnl.json     Auto-generated: P&L and backtest tracking data (gitignored)
+positions.json     Auto-generated: Open positions tracking (gitignored)
+risk_state.json    Auto-generated: Risk management state (gitignored)
 ```
 
 ---
