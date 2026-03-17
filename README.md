@@ -453,7 +453,13 @@ The bot can automatically bridge USDC from your Solana wallet to your Polygon ad
 - **Market query** – Customize `query_terms` to match different Polymarket questions.
 - **Trade size** – Use `/set_trade_amount` in Telegram or set in config.
 - **Auto-funding** – Configure `MIN_POLY_BALANCE_USDC` and `BRIDGE_FUND_AMOUNT` via Telegram or env vars.
-- **Advanced ML** – Replace `predict_up_down()` with a logistic-regression or neural-network model trained on historical data from `cg.get_coin_market_chart_by_id()`.
+- **Multi-Signal Engine** – The bot uses a weighted signal combination:
+  - MA Crossover (30% weight)
+  - RSI (14) with Overbought/Oversold detection (30% weight)
+  - MACD (12, 26, 9) (25% weight)
+  - Polymarket price deviation (15% weight)
+- **Logistic Regression Fallback** – A simple numpy-based LogReg model trained on-the-fly using 7 days of CoinGecko historical data provides additional confirmation signals.
+- **Confidence Threshold** – Set minimum confidence (default: 68%) via `/set_confidence_threshold`. Trades are only executed when confidence ≥ threshold.
 
 ---
 
