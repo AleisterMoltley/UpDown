@@ -22,7 +22,7 @@ import os
 import sys
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -109,9 +109,19 @@ POLYMARKET_BRIDGE_URL = "https://bridge.polymarket.com/deposit"
 # Gamma API
 GAMMA_API_BASE = "https://gamma-api.polymarket.com"
 
+# Sensitive keys that should not be saved to disk
+SENSITIVE_KEYS = frozenset([
+    "solana_private_key",
+    "polygon_private_key",
+    "polymarket_api_key",
+    "polymarket_api_secret",
+    "polymarket_api_passphrase",
+])
+
 # Global state
 bot_config: dict = {}
 bot_thread: threading.Thread | None = None
+bot_thread_lock = threading.Lock()  # Lock for thread-safe bot start/stop
 stop_event = threading.Event()
 cg = CoinGeckoAPI()
 
@@ -154,10 +164,7 @@ def save_config() -> None:
     """Save current configuration to file."""
     try:
         # Don't save sensitive keys to file (keep them in memory only)
-        safe_config = {k: v for k, v in bot_config.items()
-                       if k not in ["solana_private_key", "polygon_private_key",
-                                    "polymarket_api_key", "polymarket_api_secret",
-                                    "polymarket_api_passphrase"]}
+        safe_config = {k: v for k, v in bot_config.items() if k not in SENSITIVE_KEYS}
         with open(CONFIG_FILE, "w") as f:
             json.dump(safe_config, f, indent=2)
     except OSError as e:
@@ -855,19 +862,23 @@ async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     sol_bal = get_solana_balance()
     poly_bal = get_polygon_balance()
 
-    sol_addr = get_solana_pubkey() or "Not configured"
-    poly_addr = get_polygon_address() or "Not configured"
+    sol_addr = get_solana_pubkey()
+    poly_addr = get_polygon_address()
+
+    # Format addresses safely (only truncate if we have a real address)
+    sol_addr_display = f"`{sol_addr[:20]}...`" if sol_addr else "Not configured"
+    poly_addr_display = f"`{poly_addr[:20]}...`" if poly_addr else "Not configured"
 
     text = f"""
 💰 **Wallet Balances**
 
 **Solana Wallet:**
-Address: `{sol_addr[:20]}...` (if configured)
+Address: {sol_addr_display}
 USDC: ${sol_bal.get('usdc', 0):.2f}
 SOL: {sol_bal.get('sol', 0):.4f}
 
 **Polygon Wallet:**
-Address: `{poly_addr[:20]}...` (if configured)
+Address: {poly_addr_display}
 USDC: ${poly_bal:.2f}
 
 **Auto-Fund Settings:**
@@ -943,7 +954,7 @@ async def pnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 """
     daily = pnl.get("daily", {})
     for i in range(7):
-        date = (datetime.now(timezone.utc) - __import__("datetime").timedelta(days=i)).strftime("%Y-%m-%d")
+        date = (datetime.now(timezone.utc) - timedelta(days=i)).strftime("%Y-%m-%d")
         day_data = daily.get(date, {"trades": 0, "profit": 0.0})
         marker = "📍" if date == today else "  "
         text += f"{marker} {date}: {day_data.get('trades', 0)} trades, ${day_data.get('profit', 0):.2f}\n"
@@ -1372,32 +1383,38 @@ async def start_bot_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await unauthorized_response(update)
         return
 
-    global bot_thread, stop_event
+    global bot_thread
 
-    if bot_config.get("bot_running", False):
-        await update.message.reply_text("⚠️ Bot is already running!")
-        return
+    with bot_thread_lock:
+        if bot_config.get("bot_running", False):
+            await update.message.reply_text("⚠️ Bot is already running!")
+            return
 
-    # Create notification function that uses the application
-    async def send_notification_async(text: str):
-        try:
-            await context.bot.send_message(
-                chat_id=TELEGRAM_CHAT_ID,
-                text=text,
-                parse_mode="Markdown",
-            )
-        except Exception as e:
-            logger.error(f"Failed to send notification: {e}")
+        # Get the current event loop to schedule notifications from the bot thread
+        loop = asyncio.get_event_loop()
+        bot_instance = context.bot
 
-    def send_notification(text: str):
-        asyncio.run(send_notification_async(text))
+        def send_notification(text: str):
+            """Send notification from bot thread to Telegram (thread-safe)."""
+            async def _send():
+                try:
+                    await bot_instance.send_message(
+                        chat_id=TELEGRAM_CHAT_ID,
+                        text=text,
+                        parse_mode="Markdown",
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to send notification: {e}")
 
-    stop_event.clear()
-    bot_config["bot_running"] = True
-    save_config()
+            # Schedule coroutine on the main event loop (thread-safe)
+            asyncio.run_coroutine_threadsafe(_send(), loop)
 
-    bot_thread = threading.Thread(target=bot_loop, args=(send_notification,), daemon=True)
-    bot_thread.start()
+        stop_event.clear()
+        bot_config["bot_running"] = True
+        save_config()
+
+        bot_thread = threading.Thread(target=bot_loop, args=(send_notification,), daemon=True)
+        bot_thread.start()
 
     mode = "🧪 Dry Run" if bot_config.get("dry_run", True) else "💰 Live Trading"
 
@@ -1417,15 +1434,14 @@ async def stop_bot_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await unauthorized_response(update)
         return
 
-    global stop_event
+    with bot_thread_lock:
+        if not bot_config.get("bot_running", False):
+            await update.message.reply_text("⚠️ Bot is not running!")
+            return
 
-    if not bot_config.get("bot_running", False):
-        await update.message.reply_text("⚠️ Bot is not running!")
-        return
-
-    stop_event.set()
-    bot_config["bot_running"] = False
-    save_config()
+        stop_event.set()
+        bot_config["bot_running"] = False
+        save_config()
 
     await update.message.reply_text(
         "⏹️ **Bot Stopped**\n\n"
@@ -1646,13 +1662,36 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
     elif data == "start_bot":
-        if bot_config.get("bot_running", False):
-            await query.edit_message_text("⚠️ Bot is already running!")
-            return
+        global bot_thread
+        with bot_thread_lock:
+            if bot_config.get("bot_running", False):
+                await query.edit_message_text("⚠️ Bot is already running!")
+                return
 
-        # Start bot logic (simplified for callback)
-        bot_config["bot_running"] = True
-        save_config()
+            # Get the current event loop to schedule notifications from the bot thread
+            loop = asyncio.get_event_loop()
+            bot_instance = context.bot
+
+            def send_notification(text: str):
+                """Send notification from bot thread to Telegram (thread-safe)."""
+                async def _send():
+                    try:
+                        await bot_instance.send_message(
+                            chat_id=TELEGRAM_CHAT_ID,
+                            text=text,
+                            parse_mode="Markdown",
+                        )
+                    except Exception as e:
+                        logger.error(f"Failed to send notification: {e}")
+
+                asyncio.run_coroutine_threadsafe(_send(), loop)
+
+            stop_event.clear()
+            bot_config["bot_running"] = True
+            save_config()
+
+            bot_thread = threading.Thread(target=bot_loop, args=(send_notification,), daemon=True)
+            bot_thread.start()
 
         mode = "🧪 Dry Run" if bot_config.get("dry_run", True) else "💰 Live"
         text = f"▶️ **Bot Started**\n\nMode: {mode}\nUse /stop_bot to stop."
@@ -1660,12 +1699,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         keyboard = [[InlineKeyboardButton("« Back", callback_data="back_main")]]
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
-        # Note: Full bot loop requires calling start_bot_command properly
-
     elif data == "stop_bot":
-        stop_event.set()
-        bot_config["bot_running"] = False
-        save_config()
+        with bot_thread_lock:
+            stop_event.set()
+            bot_config["bot_running"] = False
+            save_config()
 
         text = "⏹️ **Bot Stopped**"
 
