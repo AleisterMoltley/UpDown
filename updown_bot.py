@@ -72,6 +72,11 @@ KELLY_AVG_WIN_PCT = 0.07  # 7% average win from backtest
 KELLY_AVG_LOSS_PCT = 0.04  # 4% average loss from backtest
 KELLY_MAX_FRACTION = 0.25  # Maximum 25% Kelly fraction
 KELLY_MIN_TRADE_USD = 3.0  # Minimum $3 per trade
+KELLY_SLIPPAGE_BUFFER = 0.005  # 0.5% slippage buffer for edge calculation
+
+# Orderbook imbalance constants
+ORDERBOOK_IMBALANCE_THRESHOLD = 0.15  # Min imbalance to apply price edge
+ORDERBOOK_PRICE_EDGE = 0.995  # Multiply midpoint by this when imbalance favorable
 
 # ---------------------------------------------------------------------------
 # Clients
@@ -815,11 +820,11 @@ def calc_kelly_size(
             - kelly_fraction: Kelly fraction (before capping)
     """
     # Calculate edge using backtest-derived average win/loss percentages
-    # edge = (win_prob * avg_win) - (loss_prob * avg_loss)
+    # edge = (win_prob * avg_win) - (loss_prob * avg_loss) - slippage_buffer
     win_prob = confidence / 100.0
     loss_prob = 1.0 - win_prob
     
-    edge = (win_prob * KELLY_AVG_WIN_PCT) - (loss_prob * KELLY_AVG_LOSS_PCT)
+    edge = (win_prob * KELLY_AVG_WIN_PCT) - (loss_prob * KELLY_AVG_LOSS_PCT) - KELLY_SLIPPAGE_BUFFER
     edge_pct = edge * 100  # Convert to percentage for logging
     
     # Kelly fraction = edge / avg_win (capped at max 25%)
@@ -884,9 +889,49 @@ def place_trade(
         return
 
     try:
-        # Fetch current mid-point price so the order is competitive.
-        mid = clob.get_midpoint(token_id)
-        price = float(mid) if mid else 0.5
+        # Fetch order book to calculate imbalance for better entry price
+        order_book = clob.get_order_book(token_id)
+        
+        # Calculate midpoint from order book
+        bids = order_book.get("bids", [])
+        asks = order_book.get("asks", [])
+        
+        # Handle empty orderbook by falling back to default midpoint
+        if not bids and not asks:
+            mid = 0.5
+            imbalance = 0.0
+            print("Orderbook empty, using default midpoint")
+        else:
+            # Get best bid and ask prices for midpoint calculation
+            best_bid = float(bids[0].get("price", 0)) if bids else 0.0
+            best_ask = float(asks[0].get("price", 1)) if asks else 1.0
+            
+            # Calculate midpoint - use default if we can't calculate from orderbook
+            if best_bid > 0 and best_ask > 0:
+                mid = (best_bid + best_ask) / 2
+            elif best_bid > 0:
+                mid = best_bid
+            elif best_ask > 0 and best_ask < 1.0:
+                mid = best_ask
+            else:
+                mid = 0.5
+            
+            # Calculate total bid and ask volumes
+            bid_volume = sum(float(b.get("size", 0)) for b in bids)
+            ask_volume = sum(float(a.get("size", 0)) for a in asks)
+            total_volume = bid_volume + ask_volume
+            
+            # Calculate imbalance: (bid_volume - ask_volume) / (bid + ask)
+            # Only calculate if we have volume data
+            imbalance = (bid_volume - ask_volume) / total_volume if total_volume > 0 else 0.0
+        
+        # Apply price edge when imbalance is favorable for YES buys
+        # Positive imbalance = more bids than asks = strong bid support
+        price = mid
+        if imbalance > ORDERBOOK_IMBALANCE_THRESHOLD and outcome.lower() == "yes":
+            price = mid * ORDERBOOK_PRICE_EDGE
+            edge_pct = (1 - ORDERBOOK_PRICE_EDGE) * 100
+            print(f"Orderbook edge: +{edge_pct:.1f}% (imbalance: {imbalance:.3f})")
 
         order = clob.create_order(
             token_id=token_id,
