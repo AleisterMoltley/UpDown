@@ -20,6 +20,7 @@ ENV/
 .env
 *.pem
 *.key
+bot_config.json
 
 # IDE / OS
 .idea/
