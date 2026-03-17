@@ -49,6 +49,15 @@ from market_scanner import (
     scan_all_markets,
 )
 
+# Import backtest module
+from backtest import (
+    format_backtest_results,
+    format_live_vs_backtest_comparison,
+    load_backtest_results,
+    run_backtest,
+    save_backtest_results,
+)
+
 # Load environment variables from .env file
 load_dotenv()
 
@@ -3606,6 +3615,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 /set_rsi_params - RSI Parameter (period overbought oversold)
 /set_macd_params - MACD Parameter (fast slow signal)
 
+**Backtesting:**
+/backtest - 30-Tage Backtest mit 1000 Trades 📈
+  (Zeigt: Winrate, Profit-Faktor, Max-Drawdown, Sharpe-Ratio)
+
 **Info:**
 /pnl - P&L Historie anzeigen
 /help - Diese Hilfe
@@ -3693,7 +3706,112 @@ Cycle: {bot_config.get('cycle_interval_seconds', 300)}s
 Min Confidence: {min_threshold}%
 Auto MATIC: {'✅' if bot_config.get('auto_matic_topup_enabled', True) else '❌'}
 """
+    
+    # Add Live vs Backtest comparison
+    backtest_results = load_backtest_results()
+    comparison_text = format_live_vs_backtest_comparison(pnl, backtest_results)
+    text += comparison_text
+    
     await update.message.reply_text(text, parse_mode="Markdown")
+
+
+async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /backtest command.
+    
+    Runs a backtest simulation using 30 days of CoinGecko data and 1000 simulated trades.
+    Displays: Winrate, Profit-Factor, Max-Drawdown, Sharpe-Ratio.
+    Results are saved to daily_pnl.json for comparison in /status.
+    """
+    if not is_authorized(update):
+        await unauthorized_response(update)
+        return
+    
+    await update.message.reply_text(
+        "📊 **Backtest gestartet...**\n\n"
+        "⏳ Lade 30 Tage CoinGecko Daten...\n"
+        "🔄 Simuliere 1000 Trades mit Multi-Signal-Engine...\n"
+        "Dies kann einige Sekunden dauern.",
+        parse_mode="Markdown"
+    )
+    
+    try:
+        # Get crypto ID from config
+        crypto_id = bot_config.get("crypto_id", "bitcoin")
+        min_confidence = bot_config.get("min_confidence_threshold", 68)
+        
+        # Build config for backtest engine
+        backtest_config = {
+            "signal_weights": bot_config.get("signal_weights", {
+                "ma_crossover": 30,
+                "rsi": 30,
+                "macd": 25,
+                "momentum": 15,
+            }),
+            "short_window": bot_config.get("short_window", 5),
+            "long_window": bot_config.get("long_window", 20),
+            "rsi_overbought": bot_config.get("rsi_overbought", 70),
+            "rsi_oversold": bot_config.get("rsi_oversold", 30),
+        }
+        
+        # Run backtest
+        result = run_backtest(
+            crypto_id=crypto_id,
+            max_trades=1000,
+            min_confidence=min_confidence,
+            config=backtest_config,
+        )
+        
+        if result is None:
+            await update.message.reply_text(
+                "❌ **Backtest fehlgeschlagen**\n\n"
+                "Konnte keine Daten von CoinGecko abrufen.\n"
+                "Bitte später erneut versuchen.",
+                parse_mode="Markdown"
+            )
+            return
+        
+        # Save results to daily_pnl.json
+        save_backtest_results(result)
+        
+        # Format and send results
+        result_text = format_backtest_results(result)
+        
+        # Add recommendation based on metrics
+        recommendations = []
+        if result.winrate >= 55:
+            recommendations.append("✅ Winrate > 55%: Strategie zeigt positive Trefferquote")
+        elif result.winrate < 50:
+            recommendations.append("⚠️ Winrate < 50%: Strategie benötigt Optimierung")
+        
+        if result.profit_factor >= 1.5:
+            recommendations.append("✅ Profit Factor > 1.5: Gutes Gewinn/Verlust-Verhältnis")
+        elif result.profit_factor < 1.0:
+            recommendations.append("⚠️ Profit Factor < 1.0: Verluste überwiegen")
+        
+        if result.max_drawdown <= 15:
+            recommendations.append("✅ Max Drawdown ≤ 15%: Akzeptables Risiko")
+        elif result.max_drawdown > 25:
+            recommendations.append("⚠️ Max Drawdown > 25%: Hohes Risiko")
+        
+        if result.sharpe_ratio >= 1.0:
+            recommendations.append("✅ Sharpe > 1.0: Gute risikoadjustierte Rendite")
+        elif result.sharpe_ratio < 0.5:
+            recommendations.append("⚠️ Sharpe < 0.5: Geringe risikoadjustierte Rendite")
+        
+        if recommendations:
+            result_text += "\n**Empfehlungen:**\n" + "\n".join(recommendations)
+        
+        result_text += "\n\n_Ergebnisse gespeichert. Siehe /status für Live vs Backtest Vergleich._"
+        
+        await update.message.reply_text(result_text, parse_mode="Markdown")
+        
+    except Exception as e:
+        logger.error(f"Backtest error: {e}")
+        await update.message.reply_text(
+            f"❌ **Backtest Fehler**\n\n"
+            f"Ein Fehler ist aufgetreten: {str(e)[:200]}",
+            parse_mode="Markdown"
+        )
 
 
 async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -5836,6 +5954,8 @@ def main() -> None:
     application.add_handler(CommandHandler("toggle_onchain", toggle_onchain_command))
     # Risk management command
     application.add_handler(CommandHandler("risk", risk_command))
+    # Backtest command
+    application.add_handler(CommandHandler("backtest", backtest_command))
 
     # Add conversation handlers
     application.add_handler(solana_conv)
