@@ -463,7 +463,10 @@ def get_current_prediction() -> dict:
             "price": 0,
             "candles": 0,
             "crypto": bot_config.get("crypto_id", "unknown"),
-            "error": "Unable to connect to CoinGecko API. Check network/firewall.",
+            "error": (
+                "Unable to connect to CoinGecko API. "
+                "Verify network connectivity and ensure api.coingecko.com is not blocked by firewall rules."
+            ),
         }
     except Exception as e:
         logger.error(f"Error getting prediction: {e}")
@@ -471,7 +474,7 @@ def get_current_prediction() -> dict:
             "prediction": "error",
             "price": 0,
             "candles": 0,
-            "crypto": "unknown",
+            "crypto": bot_config.get("crypto_id", "unknown"),
             "error": str(e),
         }
 
